@@ -816,6 +816,38 @@ impl DwgBitReader {
         }
     }
 
+    /// Strict diagnostic decoding of one handle slot. Unlike the permissive
+    /// drawing reader, invalid forms and arithmetic overflow must not turn
+    /// into a plausible null or wrapped reference in an inspection report.
+    /// Returns the original code nibble, including relative forms.
+    pub(crate) fn read_checked_handle_slot(
+        &mut self,
+        reference_handle: u64,
+    ) -> crate::error::Result<(u8, u64)> {
+        use crate::error::DxfError;
+        let form = self.read_byte();
+        self.check_error()?;
+        let code = form >> 4;
+        let count = (form & 0x0F) as usize;
+        let invalid = || DxfError::Parse("Invalid DWG handle slot in diagnostic scan".into());
+        if count > 8 || !matches!(code, 0 | 2 | 3 | 4 | 5 | 6 | 8 | 0xA | 0xC)
+            || (matches!(code, 6 | 8) && count != 0)
+        {
+            return Err(invalid());
+        }
+        let value = self.read_handle_bytes(count);
+        self.check_error()?;
+        let handle = match code {
+            0 | 2 | 3 | 4 | 5 => Some(value),
+            6 => reference_handle.checked_add(1),
+            8 => reference_handle.checked_sub(1),
+            0xA => reference_handle.checked_add(value),
+            0xC => reference_handle.checked_sub(value),
+            _ => None,
+        }.ok_or_else(invalid)?;
+        Ok((code, handle))
+    }
+
     /// Read `length` big-endian handle bytes and convert to u64.
     fn read_handle_bytes(&mut self, length: usize) -> u64 {
         // Handle values are at most 8 bytes (u64). Reject a corrupt length.
