@@ -134,6 +134,7 @@ mod native_reference_candidates;
 pub use native_reference_candidates::{
     NativeCandidateKind, NativeEedReferenceGap, NativeHatchBoundaryList, NativeMLeaderField,
     NativeReferenceCandidate, NativeReferenceCandidates, NativeReferenceGap, NativeReferenceRole,
+    NativeUnknownHandleStream,
 };
 mod native_edits;
 pub use native_edits::{
