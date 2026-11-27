@@ -14,7 +14,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, Index, IndexMut, RangeBounds};
 use std::sync::Arc;
 
-#[cfg(feature = "serde")]
+#[cfg(any(feature = "serde", feature = "hy3d-persist-serde"))]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// 内部节点和叶子的最大子项数。只在内存里使用。
@@ -1700,14 +1700,14 @@ impl<K: Ord + Debug, V: Debug> Debug for CowMap<K, V> {
     }
 }
 
-#[cfg(feature = "serde")]
+#[cfg(any(feature = "serde", feature = "hy3d-persist-serde"))]
 impl<K: Serialize + Ord, V: Serialize> Serialize for CowMap<K, V> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_map(self.iter())
     }
 }
 
-#[cfg(feature = "serde")]
+#[cfg(any(feature = "serde", feature = "hy3d-persist-serde"))]
 impl<'de, K, V> Deserialize<'de> for CowMap<K, V>
 where
     K: Deserialize<'de> + Ord + Clone,
@@ -1999,14 +1999,14 @@ impl<T: Debug> Debug for CowSeq<T> {
     }
 }
 
-#[cfg(feature = "serde")]
+#[cfg(any(feature = "serde", feature = "hy3d-persist-serde"))]
 impl<T: Serialize> Serialize for CowSeq<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.iter())
     }
 }
 
-#[cfg(feature = "serde")]
+#[cfg(any(feature = "serde", feature = "hy3d-persist-serde"))]
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for CowSeq<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Vec::<T>::deserialize(deserializer)?.into())
