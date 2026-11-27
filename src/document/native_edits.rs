@@ -149,7 +149,7 @@ enum EdgeKind {
     Sort,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Edge {
     source: Handle,
     target: Handle,
@@ -162,6 +162,8 @@ struct Graph {
     children: HashMap<Handle, Vec<Handle>>,
     edges: Vec<Edge>,
     top_members: HashMap<Handle, Handle>,
+    shared_definitions: HashSet<Handle>,
+    block_names: HashMap<Handle, String>,
     nested_parent: HashMap<Handle, Handle>,
     floor: u64,
 }
@@ -268,15 +270,26 @@ impl Graph {
         Ok(())
     }
 
-    fn object(&mut self, doc: &CadDocument, h: Handle, o: &ObjectType) -> NativeEditResult<()> {
+    fn object(&mut self, h: Handle, o: &ObjectType) -> NativeEditResult<()> {
         if o.intrinsic_handle() != h {
             return Err(NativeEditError::Conflict(h));
         }
         self.identity(h)?;
-        if let Some(owner) = doc.object_owner(h) {
-            self.own(owner, h);
-            self.references(h, [owner])?;
-        }
+        let owner = match o {
+            ObjectType::Dictionary(v) => v.owner,
+            ObjectType::XRecord(v) => v.owner,
+            ObjectType::Group(v) => v.owner,
+            ObjectType::SortEntitiesTable(v) => v.owner_handle,
+            ObjectType::Layout(v) => v.owner,
+            ObjectType::DictionaryWithDefault(v) => v.owner,
+            ObjectType::MLineStyle(v) => v.owner,
+            ObjectType::PlaceHolder(v) => v.owner,
+            ObjectType::MultiLeaderStyle(v) => v.owner_handle,
+            ObjectType::TableStyle(v) => v.owner_handle,
+            _ => return Err(unsupported("object reference coverage not implemented")),
+        };
+        self.own(owner, h);
+        self.references(h, [owner])?;
         match o {
             ObjectType::Dictionary(d) => {
                 self.references(h, d.entries.iter().map(|(_, h)| *h))?;
@@ -294,7 +307,7 @@ impl Graph {
                     match &e.value {
                         XRecordValue::Handle(target) => self.references(h, [*target])?,
                         XRecordValue::Chunk(_) => return Err(unsupported("binary XRecord")),
-                        XRecordValue::String(_) if matches!(e.code, 5 | 105 | 320..=329) =>
+                        XRecordValue::String(_) if matches!(e.code, 5 | 105 | 320..=369 | 390..=399 | 480..=481 | 1005) =>
                             return Err(unsupported("string-encoded XRecord handle")),
                         _ => {}
                     }
@@ -342,7 +355,8 @@ impl Graph {
     fn build(doc: &CadDocument) -> NativeEditResult<Self> {
         // Do not infer safety from an incomplete list of parsed references.
         // The first version supports only the closed typed graph below.
-        if doc.dwg_source_version.is_some() || !doc.eed_by_handle.is_empty()
+        if doc.dwg_source_version.is_some() || !doc.file_dependencies.is_empty()
+            || !doc.vx_control_entries.is_empty() || !doc.eed_by_handle.is_empty()
             || !doc.object_xdata.is_empty() || !doc.raw_records.is_empty()
             || !doc.raw_record_owners.is_empty() || !doc.original_objects.is_empty()
             || doc.raw_acds_data.is_some() || !doc.raw_acds_fingerprint.is_empty()
@@ -370,7 +384,11 @@ impl Graph {
         table!(doc.layers); table!(doc.line_types); table!(doc.text_styles);
         table!(doc.dim_styles); table!(doc.app_ids); table!(doc.views);
         table!(doc.vports); table!(doc.ucss); table!(doc.vx_table); table!(doc.block_records);
+        g.shared_definitions.extend(g.identities.iter().copied());
         for b in doc.block_records.iter() {
+            if g.block_names.insert(b.handle, b.name.clone()).is_some() {
+                return Err(NativeEditError::Conflict(b.handle));
+            }
             if !b.block_entity_handle.is_null() { g.identity(b.block_entity_handle)?; }
             if !b.block_end_handle.is_null() { g.identity(b.block_end_handle)?; }
             if b.flags.is_xref || b.flags.is_xref_overlay {
@@ -383,7 +401,18 @@ impl Graph {
                     return Err(NativeEditError::Conflict(*h));
                 }
             }
-            for h in &b.insert_handles { g.reserve(*h)?; }
+            let mut seen_inserts = HashSet::new();
+            for h in &b.insert_handles {
+                g.reserve(*h)?;
+                if let Some(e) = doc.get_entity(*h) {
+                    if !seen_inserts.insert(*h)
+                        || !matches!(e, EntityType::Insert(i) if doc.block_records
+                            .get(&i.block_name).is_some_and(|definition| definition.handle == b.handle))
+                    {
+                        return Err(NativeEditError::Conflict(*h));
+                    }
+                }
+            }
         }
         if doc.entity_index.len() != doc.entities.len() {
             return Err(unsupported("inconsistent entity index"));
@@ -396,12 +425,34 @@ impl Graph {
             }
             g.entity(doc, entity.as_ref())?;
         }
-        for (h, object) in &doc.objects { g.object(doc, *h, object)?; }
+        for (h, object) in &doc.objects {
+            g.object(*h, object)?;
+            if matches!(object, ObjectType::MLineStyle(_) | ObjectType::MultiLeaderStyle(_)
+                | ObjectType::TableStyle(_) | ObjectType::PlaceHolder(_)) {
+                g.shared_definitions.insert(*h);
+            }
+        }
+        // A tombstone may reserve an unused handle, but a live nested/object
+        // identity may not masquerade as a direct block member.
+        for b in doc.block_records.iter() {
+            for h in b.entity_handles.iter().chain(&b.insert_handles) {
+                if g.identities.contains(h) && doc.get_entity(*h).is_none() {
+                    return Err(NativeEditError::Conflict(*h));
+                }
+            }
+        }
         for (&owner, &dictionary) in &doc.xdic_by_handle {
             g.references(owner, [dictionary])?;
-            if !g.identities.contains(&owner) || doc.object_owner(dictionary) != Some(owner) {
+            if !g.identities.contains(&owner) || doc.object_owner(dictionary) != Some(owner)
+                || !matches!(doc.objects.get(&dictionary), Some(ObjectType::Dictionary(_))) {
                 return Err(unsupported("unresolved extension dictionary owner"));
             }
+        }
+        for owner in doc.reactors_by_handle.keys() {
+            if !g.identities.contains(owner) {
+                return Err(unsupported("unresolved side-channel reactor owner"));
+            }
+            g.reserve(*owner)?;
         }
         for (owner, reactor) in doc.iter_object_reactor_edges() {
             // A side-channel key may be a table record, not an ObjectType.
@@ -423,6 +474,11 @@ impl Graph {
                         return Err(unsupported("invalid entity extension dictionary"));
                     }
                 }
+            }
+        }
+        for edge in &g.edges {
+            if !g.identities.contains(&edge.target) {
+                return Err(unsupported("unresolved typed reference"));
             }
         }
         Ok(g)
@@ -521,13 +577,16 @@ impl CadDocument {
                 change.entities.push(NativePatch { handle: h, before: Some(Arc::clone(entity)), after: Some(Arc::new(after)) });
             }
         }
+        let changed_object_sources: HashSet<_> = graph.edges.iter()
+            .filter(|e| doomed.contains(&e.target)
+                && matches!(e.kind, EdgeKind::Reactor | EdgeKind::Group | EdgeKind::Sort))
+            .map(|e| e.source).collect();
         for (&h, object) in &self.objects {
             if doomed.contains(&h) {
                 change.objects.push(NativePatch { handle: h, before: Some(object.clone()), after: None });
                 continue;
             }
-            let needs = graph.edges.iter().any(|e| e.source == h && doomed.contains(&e.target)
-                && matches!(e.kind, EdgeKind::Reactor | EdgeKind::Group | EdgeKind::Sort));
+            let needs = changed_object_sources.contains(&h);
             if needs {
                 let mut after = object.clone();
                 if let Some(reactors) = object_reactors_mut(&mut after) {
@@ -571,7 +630,7 @@ impl CadDocument {
                 }
             }
         }
-        self.apply_native_change(&change, true)?;
+        self.apply_native_change_with_graph(&change, true, &graph)?;
         Ok(change)
     }
 
@@ -582,6 +641,18 @@ impl CadDocument {
     /// are not copied; copies use their newly allocated default sort handles.
     /// Cross-document, unsupported association and opaque copy are rejected.
     pub fn copy_entities(&mut self, handles: &[Handle]) -> NativeEditResult<NativeChange> {
+        self.copy_entities_with(handles, |_, _| Ok(()))
+    }
+
+    /// Like copy_entities, but apply a caller-supplied geometry transformation
+    /// to each detached copy before committing. Identity, ownership and the
+    /// supported reference graph must remain unchanged by the callback.
+    /// Callback errors leave the drawing untouched.
+    pub fn copy_entities_with(
+        &mut self,
+        handles: &[Handle],
+        mut transform: impl FnMut(Handle, &mut EntityType) -> NativeEditResult<()>,
+    ) -> NativeEditResult<NativeChange> {
         if handles.is_empty() { return Ok(NativeChange::default()); }
         let graph = Graph::build(self)?;
         let mut seen = HashSet::new();
@@ -590,8 +661,8 @@ impl CadDocument {
         for e in &graph.edges {
             if closure.contains(&e.source) && !closure.contains(&e.target) {
                 if matches!(e.kind, EdgeKind::Reactor | EdgeKind::SideReactor)
-                    || self.get_entity(e.target).is_some() && !matches!(
-                        self.get_entity(e.target), Some(EntityType::AttributeDefinition(_)))
+                    || !(graph.shared_definitions.contains(&e.target)
+                        || matches!(self.get_entity(e.target), Some(EntityType::AttributeDefinition(_))))
                     || graph.nested_parent.contains_key(&e.target) {
                     return Err(unsupported("copy requires explicit external reference policy"));
                 }
@@ -646,6 +717,32 @@ impl CadDocument {
                     .ok_or(unsupported("missing block definition"))?;
                 insert_appends.entry(definition.handle).or_default().push(new);
             }
+            let mut before_transform = Graph::default();
+            before_transform.entity(self, &copy)?;
+            // Capture the INSERT definition name too: graph equality alone
+            // would not detect a name change that aliases the same record.
+            let definition_before = match &copy {
+                EntityType::Insert(i) => Some(i.block_name.clone()),
+                _ => None,
+            };
+            let variant = std::mem::discriminant(&copy);
+            transform(old, &mut copy)?;
+            let mut after_transform = Graph::default();
+            after_transform.entity(self, &copy)?;
+            let definition_after = match &copy {
+                EntityType::Insert(i) => Some(i.block_name.clone()),
+                _ => None,
+            };
+            if copy.common().handle != new
+                || variant != std::mem::discriminant(&copy)
+                || definition_before != definition_after
+                || before_transform.identities != after_transform.identities
+                || before_transform.children != after_transform.children
+                || before_transform.nested_parent != after_transform.nested_parent
+                || before_transform.edges != after_transform.edges
+            {
+                return Err(unsupported("copy transformation changed the reference graph"));
+            }
             entity_appends.entry(copy.common().owner_handle).or_default().push(new);
             change.top_level_copies.push((old, new));
             change.entities.push(NativePatch { handle: new, before: None, after: Some(Arc::new(copy)) });
@@ -699,7 +796,7 @@ impl CadDocument {
             return Err(unsupported("copy owner not found"));
         }
         change.allocation_floor = next;
-        self.apply_native_change(&change, true)?;
+        self.apply_native_change_with_graph(&change, true, &graph)?;
         Ok(change)
     }
 
@@ -721,6 +818,10 @@ impl CadDocument {
         if change.entities.is_empty() && change.objects.is_empty() && change.members.is_empty()
             && change.reactors.is_empty() && change.dictionaries.is_empty() { return Ok(()); }
         let graph = Graph::build(self)?;
+        self.apply_native_change_with_graph(change, forward, &graph)
+    }
+
+    fn apply_native_change_with_graph(&mut self, change: &NativeChange, forward: bool, graph: &Graph) -> NativeEditResult<()> {
         let mut removed = HashSet::new();
         let mut added = HashSet::new();
         let mut touched_entities = HashSet::new();
@@ -781,12 +882,44 @@ impl CadDocument {
                 if !covered { return Err(NativeEditError::Conflict(e.target)); }
             }
         }
+        // Validate outgoing references of restored/inserted/modified records
+        // against the final identity set, without cloning the drawing. This
+        // catches e.g. a definition removed between copy undo and redo.
+        let mut staged = Graph::default();
+        for patch in &change.entities {
+            if let Some(value) = patch.values(forward).1 { staged.entity(self, value.as_ref())?; }
+        }
+        for patch in &change.objects {
+            if let Some(value) = patch.values(forward).1 { staged.object(patch.handle, value)?; }
+        }
+        let live_after = |h: Handle| !removed.contains(&h)
+            && (graph.identities.contains(&h) || added.contains(&h));
+        for edge in &staged.edges {
+            if !live_after(edge.target) { return Err(NativeEditError::Conflict(edge.target)); }
+        }
+        for patch in &change.reactors {
+            if let Some(values) = patch.values(forward).1 {
+                if !live_after(patch.handle) || values.iter().any(|h| !h.is_null() && !live_after(*h)) {
+                    return Err(NativeEditError::Conflict(patch.handle));
+                }
+            }
+        }
+        for patch in &change.dictionaries {
+            if let Some(target) = patch.values(forward).1 {
+                let staged_owner = staged.children.get(&patch.handle).is_some_and(|children| children.contains(target));
+                if !live_after(patch.handle) || !live_after(*target)
+                    || !(staged_owner || self.object_owner(*target) == Some(patch.handle)) {
+                    return Err(NativeEditError::Conflict(patch.handle));
+                }
+            }
+        }
         let mut members = Vec::with_capacity(change.members.len());
         for patch in &change.members {
-            let block = self.block_records.iter().find(|b| b.handle == patch.owner)
-                .ok_or(NativeEditError::Missing(patch.owner))?;
+            let name = graph.block_names.get(&patch.owner).ok_or(NativeEditError::Missing(patch.owner))?;
+            let block = self.block_records.get(name).filter(|b| b.handle == patch.owner)
+                .ok_or(NativeEditError::Conflict(patch.owner))?;
             let result = patch.replay(member_slice(block, patch.kind), forward)?;
-            members.push((patch.owner, patch.kind, result));
+            members.push((name.clone(), patch.kind, result));
         }
         // All fallible logical checks are above. Replay only touched values.
         // The native Arc helpers preserve first-touch recording. No structure
@@ -814,8 +947,8 @@ impl CadDocument {
             if let Some(value) = patch.values(forward).1 { self.xdic_by_handle.insert(patch.handle, *value); }
             else { self.xdic_by_handle.remove(&patch.handle); }
         }
-        for (owner, kind, value) in members {
-            let block = self.block_records.iter_mut().find(|b| b.handle == owner).expect("preflight owner");
+        for (name, kind, value) in members {
+            let block = self.block_records.get_mut(&name).expect("preflight owner");
             *member_slice_mut(block, kind) = value;
         }
         Ok(())
