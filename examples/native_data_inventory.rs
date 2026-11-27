@@ -144,6 +144,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for gap in index.eed_gaps().iter().take(24) {
             println!("eed_reference_gap={gap:?}");
         }
+        for observation in index.unknown_handle_streams() {
+            match &observation.result {
+                Some(Ok(stream)) => {
+                    let model_slots = stream.slots.iter().filter(|slot|
+                        model.contains(&Handle::new(slot.handle))).count();
+                    let null_slots = stream.slots.iter().filter(|slot| slot.handle == 0).count();
+                    let mut codes = BTreeMap::<u8, usize>::new();
+                    for slot in &stream.slots { *codes.entry(slot.code).or_default() += 1; }
+                    println!("unknown_stream owner={} type={} start_bit={} slots={} model_slots={} null_slots={} codes={codes:?} trailing_bits={} trailing_value={} coverage=PARTIAL",
+                        observation.owner.value(), stream.type_code, stream.stream_start_bit,
+                        stream.slots.len(), model_slots, null_slots,
+                        stream.trailing_bits, stream.trailing_value);
+                    for slot in stream.slots.iter().filter(|slot|
+                        model.contains(&Handle::new(slot.handle))).take(24) {
+                        println!("  unknown_model_reference={slot:?}");
+                    }
+                }
+                Some(Err(error)) => println!("unknown_stream owner={} failed={error}", observation.owner.value()),
+                None => println!("unknown_stream owner={} unavailable", observation.owner.value()),
+            }
+        }
         for target in targets {
             println!("target={} incoming_candidates={} observed_children={}",
                 target.value(), index.incoming(target).len(), index.observed_children(target).count());
