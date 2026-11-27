@@ -1,7 +1,7 @@
 //! One current, read-only inventory of protected numeric CAD identities.
 use super::{CadDocument, HandleReservationError};
 use crate::{entities::EntityType, types::Handle, AuditLocation};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 mod entities;
 mod objects;
 mod tables;
@@ -12,6 +12,8 @@ pub(crate) struct HandleUsage {
     markers: HashMap<Handle, (Handle, bool)>,
     location: AuditLocation,
     prefix: String,
+    // Only enabled by the native-edit header/table preflight.
+    table_refs: Option<HashSet<Handle>>,
 }
 impl HandleUsage {
     fn new() -> Self {
@@ -21,10 +23,23 @@ impl HandleUsage {
             markers: HashMap::new(),
             location: AuditLocation::Document,
             prefix: String::new(),
+            table_refs: None,
         }
     }
     pub(crate) fn protect(&mut self, h: Handle) {
         self.max = self.max.max(h.value());
+        if let Some(refs) = &mut self.table_refs {
+            if !h.is_null() {
+                refs.insert(h);
+            }
+        }
+    }
+    // Block memberships are patched by the native edit, rather than treated
+    // as immutable incoming references. They still protect numeric handles.
+    fn member_refs(&mut self, handles: &[Handle]) {
+        for h in handles {
+            self.max = self.max.max(h.value());
+        }
     }
     pub(crate) fn optional(&mut self, h: Option<Handle>) {
         if let Some(h) = h {
@@ -68,6 +83,16 @@ impl HandleUsage {
         }
     }
 }
+/// Reuse the qualified header/table walker instead of maintaining another
+/// list of header and symbol-table handle fields. Membership vectors are
+/// handled separately by the native edit journal.
+pub(super) fn native_edit_table_protection(d: &CadDocument) -> Result<(u64, HashSet<Handle>)> {
+    let mut usage = HandleUsage::new();
+    usage.table_refs = Some(HashSet::new());
+    tables::visit(d, &mut usage)?;
+    Ok((usage.max, usage.table_refs.take().expect("table capture enabled")))
+}
+
 pub(super) fn census(d: &CadDocument) -> Result<u64> {
     let CadDocument {
         version: _,
