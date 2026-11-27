@@ -2,6 +2,7 @@
 //! cargo run --release --example native_data_inventory -- drawing.dwg
 use acadrust::document::{NativeDataCarrier, NativeDataPart};
 use acadrust::io::dwg::eed_codec::EedHandleKind;
+use acadrust::types::Handle;
 use acadrust::xdata::XDataValue;
 use acadrust::DwgReader;
 use std::collections::{BTreeMap, HashSet};
@@ -21,7 +22,18 @@ struct AppCounts {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os().nth(1).ok_or("usage: native_data_inventory drawing.dwg")?;
+    let mut args = std::env::args_os().skip(1);
+    let path = args.next().ok_or("usage: native_data_inventory drawing.dwg [--refs [decimal_handle ...]]")?;
+    let mut reference_queries = None;
+    if let Some(flag) = args.next() {
+        if flag != "--refs" {
+            return Err("expected --refs followed by optional decimal handles".into());
+        }
+        let targets = args.map(|arg| {
+            arg.to_string_lossy().parse::<u64>().map(Handle::new)
+        }).collect::<Result<Vec<_>, _>>()?;
+        reference_queries = Some(targets);
+    }
     let doc = DwgReader::from_file(std::path::Path::new(&path))?.read()?;
     let mut raw = BTreeMap::<String, (u64, u64)>::new();
     let mut apps = BTreeMap::<(String, String), AppCounts>::new();
@@ -112,5 +124,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("unqualified_backing={backing:?}");
     println!("undecoded_samples={undecoded_samples:?}");
     println!("coverage=PARTIAL; decoded slot counts are not a complete reference audit or safe-edit certificate");
+    if let Some(targets) = reference_queries {
+        let index = doc.native_reference_candidates();
+        let mut kinds = BTreeMap::<String, usize>::new();
+        let mut target_count = 0usize;
+        for target in index.targets() {
+            target_count += 1;
+            for candidate in index.incoming(target) {
+                *kinds.entry(format!("{:?}", candidate.kind)).or_default() += 1;
+            }
+        }
+        println!("reference_candidate_targets={target_count} evidence_by_kind={kinds:?}");
+        println!("reference_gaps={} eed_gaps={} raw_carriers={} structured_binary_records={} opaque_records={}",
+            index.gaps().len(), index.eed_gaps().len(), index.raw_record_carriers(),
+            index.structured_binary_records(), index.opaque_records());
+        for gap in index.gaps().iter().filter(|gap| gap.error.is_some()).take(24) {
+            println!("reference_gap={gap:?}");
+        }
+        for gap in index.eed_gaps().iter().take(24) {
+            println!("eed_reference_gap={gap:?}");
+        }
+        for target in targets {
+            println!("target={} incoming_candidates={} observed_children={}",
+                target.value(), index.incoming(target).len(), index.observed_children(target).count());
+            for candidate in index.incoming(target).iter().take(32) {
+                println!("  {candidate:?}");
+            }
+        }
+        println!("reference_coverage=PARTIAL; no safe-delete set inferred");
+    }
     Ok(())
 }
