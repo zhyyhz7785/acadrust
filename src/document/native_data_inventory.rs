@@ -34,6 +34,8 @@ pub struct NativeEedBlock<'a> {
     pub application: Handle,
     pub application_name: Option<&'a str>,
     pub bytes: &'a [u8],
+    /// Encoding-version assumption used to decode this block.
+    pub encoding_version: DxfVersion,
     pub inspection: Option<EedPayloadInspection>,
 }
 
@@ -72,7 +74,7 @@ pub enum NativeDataPart<'a> {
 struct Inventory<'a, F> {
     applications: HashMap<u64, Option<&'a str>>,
     layers: HashMap<u64, Option<&'a str>>,
-    wide: bool,
+    encoding_version: DxfVersion,
     visitor: F,
 }
 
@@ -85,11 +87,12 @@ fn index_name<'a>(map: &mut HashMap<u64, Option<&'a str>>, handle: Handle, name:
 impl<'a, F: FnMut(NativeDataPart<'a>)> Inventory<'a, F> {
     fn raw(&mut self, owner: Handle, carrier: NativeDataCarrier, app: u64, bytes: &'a [u8]) {
         let application_name = self.applications.get(&app).copied().flatten();
-        let inspection = inspect_eed_payload(bytes, self.wide, |h| {
+        let inspection = inspect_eed_payload(bytes, self.encoding_version >= DxfVersion::AC1021, |h| {
             self.layers.get(&h).copied().flatten().map(str::to_owned)
         });
         (self.visitor)(NativeDataPart::Eed(NativeEedBlock {
-            owner, carrier, application: Handle::new(app), application_name, bytes, inspection,
+            owner, carrier, application: Handle::new(app), application_name, bytes,
+            encoding_version: self.encoding_version, inspection,
         }));
     }
 
@@ -126,7 +129,8 @@ impl CadDocument {
     /// INSERT attributes and typed polyface/polygon-mesh child records;
     /// other compound/opaque payloads are not exhaustively decoded here.
     /// APPID/layer lookup is built once, so inspecting EED does not repeatedly
-    /// traverse symbol tables. No data or document-wide snapshots are cloned.
+    /// traverse symbol tables. Original storage is borrowed, not cloned;
+    /// decoded EED values and slot lists are temporary owned allocations.
     pub fn visit_native_data<'a>(&'a self, visitor: impl FnMut(NativeDataPart<'a>)) {
         let mut applications = HashMap::new();
         let mut layers = HashMap::new();
@@ -139,7 +143,7 @@ impl CadDocument {
         let mut inventory = Inventory {
             applications,
             layers,
-            wide: self.dwg_source_version.unwrap_or(self.version) >= DxfVersion::AC1021,
+            encoding_version: self.dwg_source_version.unwrap_or(self.version),
             visitor,
         };
         // Borrow self, not the inventory, while invoking its mutable visitor.
@@ -194,6 +198,8 @@ impl CadDocument {
             }
         }
         inventory.backing("original_objects", self.original_objects.len());
+        inventory.backing("file_dependencies", self.file_dependencies.len());
+        inventory.backing("vx_control_entries", self.vx_control_entries.len());
         inventory.backing("raw_record_owners", self.raw_record_owners.len());
         inventory.backing("block_entity_handles", self.block_entity_handles.len());
         inventory.backing("r12_header_raw", usize::from(self.r12_header_raw.is_some()));
