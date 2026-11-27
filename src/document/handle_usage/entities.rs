@@ -4,7 +4,7 @@ use crate::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
 pub(super) fn xdata(x: &ExtendedData, u: &mut HandleUsage) -> Result<()> {
     x.reservation_fields();
     if !x.raw_dwg_eed.is_empty() {
-        return Err(u.unsupported("extended_data.raw_dwg_eed"));
+        u.inspect_unqualified_storage("extended_data.raw_dwg_eed")?;
     }
     for r in x.records() {
         let ExtendedDataRecord {
@@ -66,16 +66,16 @@ fn common(c: &EntityCommon, u: &mut HandleUsage) -> Result<()> {
     } = c;
 
     if c.raw_record.is_some() {
-        return Err(u.unsupported("common.raw_record"));
+        u.inspect_unqualified_storage("common.raw_record")?;
     }
     if c.graphic_data.is_some() {
-        return Err(u.unsupported("common.graphic_data"));
+        u.inspect_unqualified_storage("common.graphic_data")?;
     }
     if c.r12_metadata.is_some() {
-        return Err(u.unsupported("common.r12_metadata"));
+        u.inspect_unqualified_storage("common.r12_metadata")?;
     }
     if c.has_ds_data {
-        return Err(u.unsupported("common.has_ds_data"));
+        u.inspect_unqualified_storage("common.has_ds_data")?;
     }
 
     u.optional(c.layer_handle);
