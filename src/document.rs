@@ -4668,6 +4668,22 @@ impl CadDocument {
             .unwrap_or(&[])
     }
 
+    /// Iterate over the stored non-entity reactor side-channel edges.
+    ///
+    /// Each pair is (owner handle, reactor handle). The order is unspecified;
+    /// callers can build an incoming-reference index in a single pass.
+    /// This enumerates the stored side channel, including owners that are not
+    /// entries in the object table. It does not enumerate entity reactors,
+    /// explicit object reactor fields, or every effective writer reference.
+    /// No liveness filtering or reference validation is performed.
+    pub fn iter_object_reactor_edges(&self) -> impl Iterator<Item = (Handle, Handle)> + '_ {
+        self.reactors_by_handle
+            .iter()
+            .flat_map(|(&owner, reactors)| {
+                reactors.iter().copied().map(move |reactor| (owner, reactor))
+            })
+    }
+
     /// Add `reactor` to a non-entity object's reactors, once.
     pub fn add_object_reactor(&mut self, object: Handle, reactor: Handle) {
         let reactors = self.reactors_by_handle.entry(object).or_default();
@@ -7164,4 +7180,38 @@ fn valid_symbol_table_name(name: &str) -> bool {
                     '<' | '>' | '/' | '\\' | '"' | ':' | ';' | '?' | '*' | '|' | ',' | '=' | '`'
                 )
         })
+}
+
+#[cfg(test)]
+mod object_reactor_edge_tests {
+    use super::{CadDocument, Handle};
+
+    #[test]
+    fn empty_side_channel_has_no_edges() {
+        let doc = CadDocument::new();
+        assert_eq!(doc.iter_object_reactor_edges().count(), 0);
+    }
+
+    #[test]
+    fn enumerates_stored_edges_without_guessing_owner_keys() {
+        let mut doc = CadDocument::new();
+        let owner_a = doc.allocate_handle();
+        let owner_b = doc.allocate_handle();
+        let target_a = doc.allocate_handle();
+        let target_b = doc.allocate_handle();
+        doc.add_object_reactor(owner_a, target_a);
+        doc.add_object_reactor(owner_a, target_b);
+        doc.add_object_reactor(owner_b, target_a);
+        doc.add_object_reactor(owner_a, target_a);
+
+        let mut edges: Vec<(Handle, Handle)> = doc.iter_object_reactor_edges().collect();
+        edges.sort_by_key(|(owner, target)| (owner.value(), target.value()));
+        assert_eq!(
+            edges,
+            vec![(owner_a, target_a), (owner_a, target_b), (owner_b, target_a)]
+        );
+        assert_eq!(doc.object_reactors(owner_a), &[target_a, target_b]);
+        assert_eq!(doc.object_reactors(owner_b), &[target_a]);
+        assert!(doc.object_reactors(target_a).is_empty());
+    }
 }
