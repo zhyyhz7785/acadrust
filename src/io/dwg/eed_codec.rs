@@ -14,9 +14,9 @@
 //!   * `0`  string   — R2007+: `u16` code-unit count + UTF-16LE; earlier:
 //!                      `u8` byte length + `u16` codepage + encoded bytes.
 //!   * `2`  control  — one byte: `0` = `{`, `1` = `}`.
-//!   * `3`  layer    — 8-byte little-endian layer table handle.
+//!   * `3`  layer    — 8-byte big-endian layer table handle.
 //!   * `4`  binary   — `u8` length + raw bytes.
-//!   * `5`  handle   — 8-byte little-endian handle value.
+//!   * `5`  handle   — 8-byte big-endian handle value.
 //!   * `10..=13` point/pos/disp/dir — three `f64` (x, y, z).
 //!   * `40..=42` real/distance/scale — one `f64`.
 //!   * `70` int16    — one `i16`.
@@ -134,6 +134,63 @@ pub fn decode_values(
     wide: bool,
     layer_name: impl Fn(u64) -> Option<String>,
 ) -> Option<Vec<XDataValue>> {
+    decode_values_with_slots(bytes, wide, layer_name, |_| {})
+}
+
+/// The typed meaning of a handle slot in a DWG EED payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EedHandleKind {
+    /// DXF 1003: a layer reference encoded as a numeric handle in DWG.
+    Layer,
+    /// DXF 1005: an application extended-data handle.
+    Object,
+}
+
+/// A borrowed payload's eight-byte, big-endian handle slot.
+/// Offset is relative to the EED payload, not the enclosing DWG record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EedHandleSlot {
+    pub kind: EedHandleKind,
+    pub offset: usize,
+    pub handle: Handle,
+}
+
+/// Read-only inspection of a syntactically decoded EED block.
+/// The decoded values are not proof that the original bytes can be rebuilt
+/// losslessly: strings can be normalized and layer names can fail to resolve.
+/// Binary application data may contain unmodelled references. This result is
+/// not a certificate of safe deletion or copy, nor a remapping policy.
+#[derive(Debug)]
+pub struct EedPayloadInspection {
+    pub values: Vec<XDataValue>,
+    pub handle_slots: Vec<EedHandleSlot>,
+    pub contains_binary_data: bool,
+}
+
+/// Inspect the original typed handle slots without reconstructing the payload.
+/// Uses the same decoder as decode_values. A truncated or unknown item makes
+/// the whole result None; partial slots are never returned to the caller.
+/// Null handles are included. Caller must choose the source encoding family,
+/// not the intended output file version.
+pub fn inspect_eed_payload(
+    bytes: &[u8],
+    wide: bool,
+    layer_name: impl Fn(u64) -> Option<String>,
+) -> Option<EedPayloadInspection> {
+    let mut handle_slots = Vec::new();
+    let values = decode_values_with_slots(bytes, wide, layer_name, |slot| {
+        handle_slots.push(slot);
+    })?;
+    let contains_binary_data = values.iter().any(|v| matches!(v, XDataValue::BinaryData(_)));
+    Some(EedPayloadInspection { values, handle_slots, contains_binary_data })
+}
+
+fn decode_values_with_slots(
+    bytes: &[u8],
+    wide: bool,
+    layer_name: impl Fn(u64) -> Option<String>,
+    mut visit_slot: impl FnMut(EedHandleSlot),
+) -> Option<Vec<XDataValue>> {
     let mut values = Vec::new();
     let mut i = 0usize;
     let read_u16 = |b: &[u8], i: usize| -> Option<u16> {
@@ -192,6 +249,7 @@ pub fn decode_values(
                 // code 5 handles.
                 let bytes = bytes.get(i..i + 8)?;
                 let h = u64::from_be_bytes(bytes.try_into().ok()?);
+                visit_slot(EedHandleSlot { kind: EedHandleKind::Layer, offset: i, handle: Handle::new(h) });
                 i += 8;
                 values.push(XDataValue::LayerName(layer_name(h).unwrap_or_default()));
             }
@@ -209,6 +267,7 @@ pub fn decode_values(
                 // BricsCAD audit: XData handle (DA06000000000000)).
                 let bytes = bytes.get(i..i + 8)?;
                 let h = u64::from_be_bytes(bytes.try_into().ok()?);
+                visit_slot(EedHandleSlot { kind: EedHandleKind::Object, offset: i, handle: Handle::new(h) });
                 i += 8;
                 values.push(XDataValue::Handle(Handle::new(h)));
             }
