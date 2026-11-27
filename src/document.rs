@@ -132,8 +132,8 @@ mod native_data_inventory;
 pub use native_data_inventory::{NativeDataCarrier, NativeDataPart, NativeEedBlock};
 mod native_reference_candidates;
 pub use native_reference_candidates::{
-    NativeCandidateKind, NativeEedReferenceGap, NativeReferenceCandidate, NativeReferenceCandidates,
-    NativeReferenceGap,
+    NativeCandidateKind, NativeEedReferenceGap, NativeHatchBoundaryList, NativeMLeaderField,
+    NativeReferenceCandidate, NativeReferenceCandidates, NativeReferenceGap, NativeReferenceRole,
 };
 mod native_edits;
 pub use native_edits::{
