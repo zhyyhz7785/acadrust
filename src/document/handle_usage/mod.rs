@@ -1,5 +1,5 @@
 //! One current, read-only inventory of protected numeric CAD identities.
-use super::{CadDocument, HandleReservationError};
+use super::{CadDocument, HandleReservationError, NativeReferenceRole, NativeHatchBoundaryList, NativeMLeaderField};
 use crate::{entities::EntityType, types::Handle, AuditLocation};
 use std::collections::{HashMap, HashSet};
 mod entities;
@@ -16,6 +16,7 @@ pub(crate) struct HandleUsage {
     table_refs: Option<HashSet<Handle>>,
     // Opt-in diagnostic capture. Never enabled by allocation census.
     candidate_refs: Option<Vec<Handle>>,
+    candidate_roles: Vec<(Handle, NativeReferenceRole)>,
     candidate_has_unqualified_storage: bool,
 }
 impl HandleUsage {
@@ -28,6 +29,7 @@ impl HandleUsage {
             prefix: String::new(),
             table_refs: None,
             candidate_refs: None,
+            candidate_roles: Vec::new(),
             candidate_has_unqualified_storage: false,
         }
     }
@@ -49,6 +51,19 @@ impl HandleUsage {
             self.max = self.max.max(h.value());
         }
     }
+    pub(crate) fn protect_role(&mut self, h: Handle, role: NativeReferenceRole) {
+        self.protect(h);
+        if self.candidate_refs.is_some() && !h.is_null() {
+            self.candidate_roles.push((h, role));
+        }
+    }
+
+    fn optional_role(&mut self, h: Option<Handle>, role: NativeReferenceRole) {
+        if let Some(h) = h { self.protect_role(h, role); }
+    }
+
+    fn diagnostic(&self) -> bool { self.candidate_refs.is_some() }
+
     pub(crate) fn optional(&mut self, h: Option<Handle>) {
         if let Some(h) = h {
             self.protect(h);
@@ -125,6 +140,7 @@ pub(super) fn native_edit_table_protection(d: &CadDocument) -> Result<(u64, Hash
 /// children, so candidates are suitable for locating a record for inspection.
 pub(super) struct ReferenceCandidates<'a> {
     pub targets: &'a [Handle],
+    pub roles: &'a [(Handle, NativeReferenceRole)],
     pub unqualified_storage: bool,
     pub error: Option<HandleReservationError>,
 }
@@ -142,10 +158,12 @@ pub(super) fn visit_reference_candidates(
         targets.dedup();
         visitor(source, ReferenceCandidates {
             targets: &targets,
+            roles: &usage.candidate_roles,
             unqualified_storage: usage.candidate_has_unqualified_storage,
             error: result.err(),
         });
         targets.clear();
+        usage.candidate_roles.clear();
         usage.candidate_refs = Some(targets);
         usage.candidate_has_unqualified_storage = false;
         usage.identities.clear();
