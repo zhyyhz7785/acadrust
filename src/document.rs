@@ -4690,6 +4690,35 @@ impl CadDocument {
             })
     }
 
+    /// Iterate over the original non-entity DWG EED blocks.
+    ///
+    /// Each item is (owner, application-table handle, payload). The bytes
+    /// are borrowed without decoding or copying; order is unspecified across
+    /// owners, and order within one owner's blocks is preserved. An owner
+    /// need not resolve to an ObjectType (it may be a symbol-table record).
+    /// This does not include entity EED, which lives in EntityCommon.
+    pub fn iter_non_entity_raw_eed(&self) -> impl Iterator<Item = (Handle, Handle, &[u8])> + '_ {
+        self.eed_by_handle.iter().flat_map(|(&owner, blocks)| {
+            blocks.iter().map(move |(app, bytes)| (owner, Handle::new(*app), bytes.as_slice()))
+        })
+    }
+
+    /// Borrow original block-member handle streams captured during DWG read.
+    ///
+    /// Unlike BlockRecord::entity_handles these may name nested children or
+    /// SEQEND records, not just flat live entities. This is original encoding
+    /// provenance, not a current ownership index.
+    pub fn iter_original_block_memberships(&self) -> impl Iterator<Item = (Handle, &[Handle])> + '_ {
+        self.block_entity_handles.iter().map(|(&owner, members)| (owner, members.as_slice()))
+    }
+
+    /// Borrow debug raw-record backing, when the source reader retained it.
+    /// This is distinct from EntityCommon::raw_record and may be empty even
+    /// when every imported entity has its own source record.
+    pub fn iter_debug_raw_records(&self) -> impl Iterator<Item = (Handle, i16, &crate::entities::RawRecord)> + '_ {
+        self.raw_records.iter().map(|(&handle, (kind, raw))| (Handle::new(handle), *kind, raw.as_ref()))
+    }
+
     /// Add `reactor` to a non-entity object's reactors, once.
     pub fn add_object_reactor(&mut self, object: Handle, reactor: Handle) {
         let reactors = self.reactors_by_handle.entry(object).or_default();
