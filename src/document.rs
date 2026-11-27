@@ -127,6 +127,12 @@ mod block_graph;
 pub use block_graph::BlockGraph;
 mod dynamic_properties;
 mod explode;
+
+mod native_edits;
+pub use native_edits::{
+    NativeChange, NativeEditError, NativeEditResult, NativeMemberKind, NativeMemberPatch,
+    NativePatch,
+};
 mod mirror;
 pub use dynamic_properties::DynamicBlockProperty;
 
