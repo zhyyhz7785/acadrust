@@ -128,6 +128,8 @@ pub use block_graph::BlockGraph;
 mod dynamic_properties;
 mod explode;
 
+mod native_data_inventory;
+pub use native_data_inventory::{NativeDataCarrier, NativeDataPart, NativeEedBlock};
 mod native_edits;
 pub use native_edits::{
     NativeChange, NativeEditError, NativeEditResult, NativeMemberKind, NativeMemberPatch,
