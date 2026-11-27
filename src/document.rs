@@ -82,7 +82,8 @@ fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture>
 mod dim_header;
 mod legacy_header;
 mod semantic_inventory;
-mod hy3d_persist;
+/// Shared persistent containers used by the enhanced native document and HY3D.
+pub mod hy3d_persist;
 mod entity_slots;
 use entity_slots::EntitySlots;
 use hy3d_persist::CowMap;
@@ -3525,9 +3526,27 @@ impl CadDocument {
 
         let base = self.entities.len();
         // Preserve the loader's Arc and slot order without a full-tree scan
-        // or a temporary contiguous geometry copy.
-        for (offset, entity) in entities.iter().enumerate() {
-            self.entity_index.insert(entity.common().handle, base + offset);
+        // or a temporary contiguous geometry copy. The first large batch can
+        // build both trees bottom-up. Duplicate handles retain the last slot,
+        // exactly as repeated inserts in the old hash index did.
+        if base == 0 && self.entity_index.is_empty() {
+            let mut entries: Vec<_> = entities.iter().enumerate()
+                .map(|(index, entity)| (entity.common().handle, index))
+                .collect();
+            entries.sort_unstable_by_key(|&(handle, index)| (handle, index));
+            entries.dedup_by(|later, earlier| {
+                if later.0 == earlier.0 {
+                    earlier.1 = later.1;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.entity_index = CowMap::from_sorted_unique(entries);
+        } else {
+            for (offset, entity) in entities.iter().enumerate() {
+                self.entity_index.insert(entity.common().handle, base + offset);
+            }
         }
         self.entities.append(entities);
         self.next_handle = next_handle;
