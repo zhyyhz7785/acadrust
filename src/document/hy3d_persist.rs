@@ -1300,6 +1300,9 @@ fn owned_record<T: Clone>(arc: Arc<T>) -> T {
 }
 
 impl<K, V> CowMap<K, V> {
+    /// Persistent nodes allocate locally; there is no contiguous capacity to reserve.
+    pub(crate) fn reserve(&mut self, _additional: usize) {}
+
     pub fn keys(&self) -> Keys<'_, K, V>
     where
         K: Ord,
