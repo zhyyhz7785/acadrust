@@ -4,7 +4,7 @@
 //! reservation candidates do not identify a reference role or establish
 //! a permissible edit action. Missing or opaque carriers stay unqualified.
 
-use super::{CadDocument, EntityCommon, EntityType, Handle, HandleReservationError, NativeDataPart};
+use super::{CadDocument, EntityCommon, EntityType, Handle, HandleReservationError, NativeDataCarrier, NativeDataPart};
 use crate::io::dwg::eed_codec::EedHandleKind;
 use crate::xdata::XDataValue;
 use std::collections::HashMap;
@@ -44,6 +44,18 @@ pub struct NativeReferenceGap {
     pub error: Option<HandleReservationError>,
 }
 
+/// A block with uncertain EED reference coverage. Binary application data
+/// is intentionally not interpreted as a known list of CAD references.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeEedReferenceGap {
+    pub owner: Handle,
+    pub carrier: NativeDataCarrier,
+    pub application: Handle,
+    pub undecoded: bool,
+    pub unresolved_application: bool,
+    pub binary: bool,
+}
+
 /// An immutable, partial reference inventory tied to the borrowed drawing.
 /// Public mutable CadDocument fields cannot invalidate it while the borrow
 /// is live. It is not a cache shared across edits. Rebuild after mutation.
@@ -52,6 +64,9 @@ pub struct NativeReferenceCandidates<'a> {
     _document: &'a CadDocument,
     incoming: HashMap<Handle, Vec<NativeReferenceCandidate>>,
     gaps: Vec<NativeReferenceGap>,
+    eed_gaps: Vec<NativeEedReferenceGap>,
+    raw_records: usize,
+    structured_binary_records: usize,
     unqualified_backing: Vec<(&'static str, usize)>,
     undecoded_eed: usize,
     unresolved_apps: usize,
@@ -65,6 +80,9 @@ impl<'a> NativeReferenceCandidates<'a> {
             _document: document,
             incoming: HashMap::new(),
             gaps: Vec::new(),
+            eed_gaps: Vec::new(),
+            raw_records: 0,
+            structured_binary_records: 0,
             unqualified_backing: Vec::new(),
             undecoded_eed: 0,
             unresolved_apps: 0,
@@ -106,6 +124,10 @@ impl<'a> NativeReferenceCandidates<'a> {
     }
 
     pub fn gaps(&self) -> &[NativeReferenceGap] { &self.gaps }
+    pub fn eed_gaps(&self) -> &[NativeEedReferenceGap] { &self.eed_gaps }
+    /// Count of observed raw carriers, not necessarily distinct records.
+    pub fn raw_record_carriers(&self) -> usize { self.raw_records }
+    pub fn structured_binary_records(&self) -> usize { self.structured_binary_records }
     pub fn unqualified_backing(&self) -> &[(&'static str, usize)] { &self.unqualified_backing }
     pub fn undecoded_eed_blocks(&self) -> usize { self.undecoded_eed }
     pub fn unresolved_app_blocks(&self) -> usize { self.unresolved_apps }
@@ -180,6 +202,9 @@ impl CadDocument {
         }
         self.visit_native_data(|part| match part {
             NativeDataPart::StructuredXdata { owner, record, .. } => {
+                if record.values.iter().any(|value| matches!(value, XDataValue::BinaryData(_))) {
+                    index.structured_binary_records += 1;
+                }
                 for value in &record.values {
                     if let XDataValue::Handle(target) = value {
                         index.add(Some(owner), *target, NativeCandidateKind::StructuredXdataHandle);
@@ -188,7 +213,16 @@ impl CadDocument {
             }
             NativeDataPart::Eed(block) => {
                 index.add(Some(block.owner), block.application, NativeCandidateKind::RawEedApplication);
-                if block.application_name.is_none() { index.unresolved_apps += 1; }
+                let undecoded = block.inspection.is_none();
+                let unresolved_application = block.application_name.is_none();
+                let binary = block.inspection.as_ref().is_some_and(|v| v.contains_binary_data);
+                if unresolved_application { index.unresolved_apps += 1; }
+                if undecoded || unresolved_application || binary {
+                    index.eed_gaps.push(NativeEedReferenceGap {
+                        owner: block.owner, carrier: block.carrier, application: block.application,
+                        undecoded, unresolved_application, binary,
+                    });
+                }
                 if let Some(inspection) = block.inspection {
                     if inspection.contains_binary_data { index.binary_eed += 1; }
                     for slot in inspection.handle_slots {
@@ -208,7 +242,7 @@ impl CadDocument {
             NativeDataPart::OtherBacking { name, count } => {
                 index.unqualified_backing.push((name, count));
             }
-            NativeDataPart::RawEntity { .. } => {}
+            NativeDataPart::RawEntity { .. } => { index.raw_records += 1; }
         });
         // Deterministic results per target and no repeated evidence of the
         // same kind/source pair. This is not a count of individual fields.
