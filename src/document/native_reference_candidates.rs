@@ -6,6 +6,8 @@
 
 use super::{CadDocument, EntityCommon, EntityType, Handle, HandleReservationError, NativeDataCarrier, NativeDataPart};
 use crate::io::dwg::eed_codec::EedHandleKind;
+use crate::io::dwg::dwg_stream_readers::{object_reader::DwgObjectReader, merged_reader::RawHandleStreamInspection};
+use crate::objects::ObjectType;
 use crate::xdata::XDataValue;
 use std::collections::HashMap;
 
@@ -27,6 +29,7 @@ pub enum NativeCandidateKind {
     RawEedApplication,
     RawEedLayer,
     RawEedHandle,
+    RawHandleStream,
 }
 
 /// Which boundary vector a typed HATCH reference belongs to.
@@ -69,6 +72,8 @@ pub enum NativeReferenceRole {
     GroupMember { index: usize },
     SortMember { index: usize },
     ProxyObjectId { index: usize },
+    /// Original DWG handle-stream slot, without inferred field semantics.
+    RawHandleSlot { bit_offset: i64, code: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +106,15 @@ pub struct NativeEedReferenceGap {
     pub binary: bool,
 }
 
+/// A retained Unknown object's independently framed handle stream.
+/// None means original bytes or version are unavailable. Err means framing
+/// or slot validation failed. Ok is still partial coverage of that object.
+#[derive(Debug)]
+pub struct NativeUnknownHandleStream {
+    pub owner: Handle,
+    pub result: Option<crate::error::Result<RawHandleStreamInspection>>,
+}
+
 /// An immutable, partial reference inventory tied to the borrowed drawing.
 /// Public mutable CadDocument fields cannot invalidate it while the borrow
 /// is live. It is not a cache shared across edits. Rebuild after mutation.
@@ -110,6 +124,7 @@ pub struct NativeReferenceCandidates<'a> {
     incoming: HashMap<Handle, Vec<NativeReferenceCandidate>>,
     gaps: Vec<NativeReferenceGap>,
     eed_gaps: Vec<NativeEedReferenceGap>,
+    unknown_handle_streams: Vec<NativeUnknownHandleStream>,
     raw_records: usize,
     structured_binary_records: usize,
     unqualified_backing: Vec<(&'static str, usize)>,
@@ -126,6 +141,7 @@ impl<'a> NativeReferenceCandidates<'a> {
             incoming: HashMap::new(),
             gaps: Vec::new(),
             eed_gaps: Vec::new(),
+            unknown_handle_streams: Vec::new(),
             raw_records: 0,
             structured_binary_records: 0,
             unqualified_backing: Vec::new(),
@@ -178,6 +194,7 @@ impl<'a> NativeReferenceCandidates<'a> {
 
     pub fn gaps(&self) -> &[NativeReferenceGap] { &self.gaps }
     pub fn eed_gaps(&self) -> &[NativeEedReferenceGap] { &self.eed_gaps }
+    pub fn unknown_handle_streams(&self) -> &[NativeUnknownHandleStream] { &self.unknown_handle_streams }
     /// Count of observed raw carriers, not necessarily distinct records.
     pub fn raw_record_carriers(&self) -> usize { self.raw_records }
     pub fn structured_binary_records(&self) -> usize { self.structured_binary_records }
@@ -292,8 +309,35 @@ impl CadDocument {
                     index.undecoded_eed += 1;
                 }
             }
-            NativeDataPart::OpaqueEntity { .. } | NativeDataPart::OpaqueObject { .. } => {
+            NativeDataPart::OpaqueEntity { .. } => {
                 index.opaque_records += 1;
+            }
+            NativeDataPart::OpaqueObject { owner, object } => {
+                index.opaque_records += 1;
+                if let ObjectType::Unknown {
+                    raw_dwg_data, raw_dwg_handle_bits, raw_dwg_version, ..
+                } = object {
+                    let result = raw_dwg_data.as_deref().zip(*raw_dwg_version).map(|(bytes, version)| {
+                        DwgObjectReader::inspect_raw_handle_stream(
+                            bytes, *raw_dwg_handle_bits, version, owner.value(),
+                        )
+                    });
+                    if let Some(Ok(inspection)) = &result {
+                        for slot in &inspection.slots {
+                            if slot.handle != 0 {
+                                index.incoming.entry(Handle::new(slot.handle)).or_default()
+                                    .push(NativeReferenceCandidate {
+                                        source: Some(owner), kind: NativeCandidateKind::RawHandleStream,
+                                        role: Some(NativeReferenceRole::RawHandleSlot {
+                                            bit_offset: slot.bit_offset, code: slot.code,
+                                        }),
+                                    });
+                            }
+                        }
+                    }
+                    // Do not remove the opaque/gap status even on success.
+                    index.unknown_handle_streams.push(NativeUnknownHandleStream { owner, result });
+                }
             }
             NativeDataPart::OtherBacking { name, count } => {
                 index.unqualified_backing.push((name, count));
