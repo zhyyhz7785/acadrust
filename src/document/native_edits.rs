@@ -165,6 +165,7 @@ struct Graph {
     edges: Vec<Edge>,
     top_members: HashMap<Handle, Handle>,
     shared_definitions: HashSet<Handle>,
+    protected_table_refs: HashSet<Handle>,
     block_names: HashMap<Handle, String>,
     entity_dictionaries: HashMap<Handle, Handle>,
     nested_parent: HashMap<Handle, Handle>,
@@ -375,7 +376,12 @@ impl Graph {
         {
             return Err(unsupported("document has opaque or unsupported side-channel data"));
         }
-        let mut g = Self { floor: doc.next_handle.max(doc.header.handle_seed), ..Self::default() };
+        let (table_max, protected_table_refs) =
+            super::handle_usage::native_edit_table_protection(doc)
+                .map_err(|_| unsupported("unqualified header or symbol-table references"))?;
+        let floor = table_max.checked_add(1).ok_or(NativeEditError::HandleOverflow)?
+            .max(doc.next_handle).max(doc.header.handle_seed).max(1);
+        let mut g = Self { floor, protected_table_refs, ..Self::default() };
         macro_rules! table {
             ($t:expr) => {{
                 let t = &$t;
@@ -573,7 +579,15 @@ fn remap(h: Handle, mapping: &HashMap<Handle, Handle>) -> Handle {
 fn remap_common(c: &mut EntityCommon, mapping: &HashMap<Handle, Handle>) {
     c.handle = remap(c.handle, mapping);
     c.owner_handle = remap(c.owner_handle, mapping);
-    c.xdictionary_handle = c.xdictionary_handle.map(|h| remap(h, mapping));
+    // Keep every typed common reference consistent with the same map.
+    for reference in [
+        &mut c.layer_handle, &mut c.linetype_handle, &mut c.color_book_handle,
+        &mut c.full_visual_style_handle, &mut c.face_visual_style_handle,
+        &mut c.edge_visual_style_handle, &mut c.material_handle,
+        &mut c.plotstyle_handle, &mut c.xdictionary_handle,
+    ] {
+        if let Some(h) = reference { *h = remap(*h, mapping); }
+    }
     for h in &mut c.reactors { *h = remap(*h, mapping); }
     c.raw_record = None;
 }
@@ -594,6 +608,9 @@ impl CadDocument {
         if handles.is_empty() { return Ok(NativeChange::default()); }
         let graph = Graph::build(self)?;
         let doomed = graph.closure(self, handles)?;
+        if doomed.iter().any(|h| graph.protected_table_refs.contains(h)) {
+            return Err(unsupported("header or symbol-table reference requires specialized removal"));
+        }
         for e in &graph.edges {
             if doomed.contains(&e.target) && !doomed.contains(&e.source)
                 && e.kind == EdgeKind::Reference {
@@ -728,6 +745,8 @@ impl CadDocument {
         let mut other: Vec<_> = closure.iter().copied().filter(|h| !seen.contains(h)).collect();
         other.sort_by_key(|h| h.value());
         order.extend(other);
+        // Header/table references also reserve their numeric slots even if
+        // dangling; do not make a new copy accidentally satisfy such a link.
         let mut next = graph.floor;
         let mut mapping = HashMap::with_capacity(order.len());
         let mut change = NativeChange::default();
@@ -908,7 +927,14 @@ impl CadDocument {
             }
         }
         for h in &added {
-            if graph.identities.contains(h) { return Err(NativeEditError::Conflict(*h)); }
+            if graph.identities.contains(h) || graph.protected_table_refs.contains(h) {
+                return Err(NativeEditError::Conflict(*h));
+            }
+        }
+        for h in &removed {
+            if graph.protected_table_refs.contains(h) {
+                return Err(NativeEditError::Conflict(*h));
+            }
         }
         // The caller must use history order. Additionally refuse fresh
         // dependencies on records about to be removed, and unexpected
