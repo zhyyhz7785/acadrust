@@ -130,6 +130,10 @@ mod explode;
 
 mod native_data_inventory;
 pub use native_data_inventory::{NativeDataCarrier, NativeDataPart, NativeEedBlock};
+mod native_reference_candidates;
+pub use native_reference_candidates::{
+    NativeCandidateKind, NativeReferenceCandidate, NativeReferenceCandidates, NativeReferenceGap,
+};
 mod native_edits;
 pub use native_edits::{
     NativeChange, NativeEditError, NativeEditResult, NativeMemberKind, NativeMemberPatch,
