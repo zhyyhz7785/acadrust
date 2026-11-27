@@ -3163,7 +3163,11 @@ impl DwgDocumentBuilder {
                 .map(|l| (l.handle.value(), l.name.clone()))
                 .collect();
             if !app_name_by_handle.is_empty() {
-                for_each_mut(&mut document.entities, |entity| {
+                // The persistent sequence supplies disjoint mutable Arc slots.
+                // Keep the existing parallel EED decoder; no entity geometry is copied.
+                let mut slots: Vec<_> = document.entities.iter_mut().collect();
+                for_each_mut(&mut slots, |slot| {
+                    let entity = &mut **slot;
                     let records: Vec<crate::xdata::ExtendedDataRecord> = {
                         let xd = &entity.common().extended_data;
                         xd.raw_dwg_eed
@@ -3791,8 +3795,10 @@ impl DwgDocumentBuilder {
         let model_space = document.header.model_space_block_handle;
         let paper_space = document.header.paper_space_block_handle;
         let paper_is_valid = valid_owners.contains(&paper_space);
-        let memberships: Vec<Option<(Handle, Handle)>> =
-            map_mut(&mut document.entities, |entity| {
+        let memberships: Vec<Option<(Handle, Handle)>> = {
+            let mut slots: Vec<_> = document.entities.iter_mut().collect();
+            map_mut(&mut slots, |slot| {
+                let entity = &mut **slot;
                 if matches!(
                     entity.as_ref(),
                     EntityType::AttributeEntity(_) | EntityType::Block(_) | EntityType::BlockEnd(_)
@@ -3818,7 +3824,8 @@ impl DwgDocumentBuilder {
                     std::sync::Arc::make_mut(entity).common_mut().owner_handle = owner;
                 }
                 valid_owners.contains(&owner).then_some((owner, handle))
-            });
+            })
+        };
         let mut by_owner: foldhash::HashMap<Handle, Vec<Handle>> =
             foldhash::HashMap::with_capacity_and_hasher(
                 document.block_records.len(),
