@@ -15,6 +15,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NativeCandidateKind {
     ModeledNumeric,
+    ModeledRole,
     Owner,
     Reactor,
     SideReactor,
@@ -28,6 +29,48 @@ pub enum NativeCandidateKind {
     RawEedHandle,
 }
 
+/// Which boundary vector a typed HATCH reference belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativeHatchBoundaryList {
+    Paths,
+    InvalidMPolygonLoops,
+    AnnotationContext,
+}
+
+/// Named MLEADER reference fields. Context and entity overrides are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativeMLeaderField {
+    Style,
+    LineType,
+    Arrowhead,
+    TextStyle,
+    BlockContent,
+    ContextTextStyle,
+    ContextBlockContent,
+    ContextScale,
+    LineOverrideType,
+    LineOverrideArrowhead,
+}
+
+/// Exact stored field location for the covered association families.
+/// Indices refer to the current immutable drawing; they are not durable IDs
+/// across edits. A role is evidence of a stored reference, not a deletion
+/// policy, and does not qualify opaque payloads or inactive context values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativeReferenceRole {
+    HatchBoundary { list: NativeHatchBoundaryList, path: usize, slot: usize },
+    DimensionAssociation,
+    DimensionSnap { slot: usize, chain: usize, intersection: bool, index: usize },
+    LeaderAnnotation,
+    MLeaderField(NativeMLeaderField),
+    MLeaderLine { root: usize, line: usize, field: NativeMLeaderField },
+    MLeaderAttribute { index: usize },
+    MLeaderArrowOverride { index: usize },
+    GroupMember { index: usize },
+    SortMember { index: usize },
+    ProxyObjectId { index: usize },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeReferenceCandidate {
     /// None denotes grouped header/symbol-table numeric protection.
@@ -35,6 +78,8 @@ pub struct NativeReferenceCandidate {
     /// other kinds can identify a nested record directly.
     pub source: Option<Handle>,
     pub kind: NativeCandidateKind,
+    /// Present only for covered modeled field locations.
+    pub role: Option<NativeReferenceRole>,
 }
 
 #[derive(Debug)]
@@ -93,7 +138,15 @@ impl<'a> NativeReferenceCandidates<'a> {
 
     fn add(&mut self, source: Option<Handle>, target: Handle, kind: NativeCandidateKind) {
         if !target.is_null() {
-            self.incoming.entry(target).or_default().push(NativeReferenceCandidate { source, kind });
+            self.incoming.entry(target).or_default().push(NativeReferenceCandidate { source, kind, role: None });
+        }
+    }
+
+    fn add_role(&mut self, source: Option<Handle>, target: Handle, role: NativeReferenceRole) {
+        if !target.is_null() {
+            self.incoming.entry(target).or_default().push(NativeReferenceCandidate {
+                source, kind: NativeCandidateKind::ModeledRole, role: Some(role),
+            });
         }
     }
 
@@ -146,6 +199,9 @@ impl CadDocument {
         super::handle_usage::visit_reference_candidates(self, |source, candidates| {
             for &target in candidates.targets {
                 index.add(source, target, NativeCandidateKind::ModeledNumeric);
+            }
+            for &(target, role) in candidates.roles {
+                index.add_role(source, target, role);
             }
             if candidates.unqualified_storage || candidates.error.is_some() {
                 index.gaps.push(NativeReferenceGap {
@@ -245,9 +301,10 @@ impl CadDocument {
             NativeDataPart::RawEntity { .. } => { index.raw_records += 1; }
         });
         // Deterministic results per target and no repeated evidence of the
-        // same kind/source pair. This is not a count of individual fields.
+        // same kind/source/role tuple. Role indices preserve repeated targets
+        // at distinct known fields. This is not an exhaustive field count.
         for candidates in index.incoming.values_mut() {
-            candidates.sort_unstable_by_key(|edge| (edge.kind, edge.source.map(|h| h.value())));
+            candidates.sort_unstable_by_key(|edge| (edge.kind, edge.source.map(|h| h.value()), edge.role));
             candidates.dedup();
         }
         index
