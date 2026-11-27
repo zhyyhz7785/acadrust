@@ -82,6 +82,10 @@ fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture>
 mod dim_header;
 mod legacy_header;
 mod semantic_inventory;
+mod hy3d_persist;
+mod entity_slots;
+use entity_slots::EntitySlots;
+use hy3d_persist::CowMap;
 pub(crate) use dim_header::{
     apply_dimension_arrow_header, dimension_arrow_dxf_name, sync_dimension_arrow_header,
 };
@@ -1293,22 +1297,15 @@ pub struct CadDocument {
     /// Notifications collected during the last read/write operation
     pub notifications: crate::notification::NotificationCollection,
 
-    /// All entities in the document (contiguous storage for cache locality).
-    /// Each entity is behind an `Arc` so cloning the whole document — the undo
-    /// snapshot on every edit — is O(entities) atomic bumps that structurally
-    /// share the geometry, not an O(entities) deep copy. A single-entity edit
-    /// (`get_entity_mut`) copies just that one entity out of the shared Arc
-    /// (`Arc::make_mut`), so the snapshot and the live doc diverge only where
-    /// they actually differ.
-    pub(crate) entities: Vec<Arc<EntityType>>,
+    /// Native entities in the original flat-slot order. Persistent nodes
+    /// share the same Arc<EntityType> records across snapshots; an edit
+    /// detaches only the path and the affected record.
+    pub(crate) entities: EntitySlots,
 
-    /// Handle → index mapping for O(1) entity lookup by handle.
-    ///
-    /// The hasher must not depend on the process: plugins read a document the
-    /// host built through a shared reference across a dynamic-library
-    /// boundary, and foldhash's `RandomState` mixes in a per-process global
-    /// seed, so every lookup from the other binary missed.
-    pub(crate) entity_index: std::collections::HashMap<Handle, usize, foldhash::fast::FixedState>,
+    /// Handle -> flat slot. The HY3D persistent ordered index shares its root
+    /// across snapshots. This changes lookup from hashing to tree traversal;
+    /// real drawing performance must be measured before product adoption.
+    pub(crate) entity_index: CowMap<Handle, usize>,
 
     /// All objects in the document (indexed by handle)
     pub objects: HashMap<Handle, ObjectType>,
@@ -1596,7 +1593,7 @@ impl CadDocument {
             vx_control_entries: Vec::new(),
             classes: DxfClassCollection::new(),
             notifications: crate::notification::NotificationCollection::new(),
-            entities: Vec::new(),
+            entities: EntitySlots::new(),
             entity_index: Default::default(),
             objects: HashMap::new(),
             block_visibility_params: HashMap::new(),
@@ -3527,11 +3524,12 @@ impl CadDocument {
         }
 
         let base = self.entities.len();
-        self.entities.append(entities);
-        for (offset, entity) in self.entities[base..].iter().enumerate() {
-            self.entity_index
-                .insert(entity.common().handle, base + offset);
+        // Preserve the loader's Arc and slot order without a full-tree scan
+        // or a temporary contiguous geometry copy.
+        for (offset, entity) in entities.iter().enumerate() {
+            self.entity_index.insert(entity.common().handle, base + offset);
         }
+        self.entities.append(entities);
         self.next_handle = next_handle;
         self.header.handle_seed = self.header.handle_seed.max(next_handle);
     }
