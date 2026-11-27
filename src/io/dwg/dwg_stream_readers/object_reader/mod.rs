@@ -466,6 +466,38 @@ impl DwgObjectReader {
         Ok((type_code, reader))
     }
 
+    /// Inspect the separately framed handle stream of a retained R2010+
+    /// merged object record. The original source version and expected
+    /// absolute object identity are required. Uses the same record splitter
+    /// as the drawing reader, but strictly rejects malformed handle slots.
+    ///
+    /// Inline handles, text, EED and application bytes are NOT qualified by
+    /// this inspection, and relative handle codes do not identify their
+    /// semantic role. A successful scan is not permission to erase or copy.
+    pub fn inspect_raw_handle_stream(
+        data: &[u8],
+        handle_bits: i64,
+        source_version: DxfVersion,
+        expected_handle: u64,
+    ) -> Result<super::merged_reader::RawHandleStreamInspection> {
+        let version = DwgVersion::from_dxf_version(source_version)?;
+        if !version.r2010_plus() {
+            return Err(DxfError::Parse("Raw handle inspection requires R2010+ framing".into()));
+        }
+        let total_bits = i64::try_from(data.len()).ok().and_then(|n| n.checked_mul(8))
+            .ok_or_else(|| DxfError::Parse("DWG raw record size overflow".into()))?;
+        if expected_handle == 0 || handle_bits < 0 || handle_bits >= total_bits {
+            return Err(DxfError::Parse("Invalid identity or handle-stream size".into()));
+        }
+        let splitter = Self::new(Vec::<u8>::new(), source_version, HashMap::new())?;
+        let (type_code, mut reader) = splitter.read_raw_record(data, handle_bits)?;
+        let (code, actual) = reader.main_mut().read_checked_handle_slot(0)?;
+        if code > 5 || actual != expected_handle {
+            return Err(DxfError::Parse("DWG raw record identity mismatch".into()));
+        }
+        reader.inspect_raw_handle_slots(type_code, actual)
+    }
+
     /// Read common data shared by all objects (entities and non-entities).
     ///
     /// This reads: object_type (already read), size placeholder, handle, xdata.

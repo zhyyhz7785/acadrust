@@ -118,6 +118,12 @@ impl NativeMemberPatch {
 /// format. Apply it only to the same document, in history order. Replay
 /// checks touched records and reference conflicts, and never swaps the
 /// header, tables, allocator, path or other unrelated document state.
+/// This is strict history replay, not an arbitrary selective undo API:
+/// touched entity images must still have their expected Arc identity, and
+/// affected block member sequences must have the expected length/positions.
+/// A mutable access that replaces a shared image, or a later addition in an
+/// affected block, can conflict even if geometry itself is unchanged.
+/// Replay rejects such conflicts rather than overriding later changes.
 #[derive(Debug, Default, Clone)]
 pub struct NativeChange {
     entities: Vec<NativePatch<Arc<EntityType>>>,
@@ -126,6 +132,7 @@ pub struct NativeChange {
     dictionaries: Vec<NativePatch<Handle>>,
     members: Vec<NativeMemberPatch>,
     copies: Vec<(Handle, Handle)>,
+    generated: Vec<Handle>,
     top_level_copies: Vec<(Handle, Handle)>,
     allocation_floor: u64,
 }
@@ -136,8 +143,17 @@ impl NativeChange {
     pub fn reactor_changes(&self) -> &[NativePatch<Vec<Handle>>] { &self.reactors }
     pub fn dictionary_changes(&self) -> &[NativePatch<Handle>] { &self.dictionaries }
     pub fn member_changes(&self) -> &[NativeMemberPatch] { &self.members }
-    /// All reallocated identities, including nested attributes and objects.
+    /// Source-to-copy identity pairs, including nested attributes and objects.
+    /// Newly synthesized records without a source handle (e.g. SEQEND) are
+    /// reported separately by generated_handles and included by created_handles.
     pub fn copied_handles(&self) -> &[(Handle, Handle)] { &self.copies }
+    /// Identities synthesized during copying, with no corresponding source record.
+    pub fn generated_handles(&self) -> &[Handle] { &self.generated }
+    /// Every identity allocated by this copy, including synthesized records.
+    /// No null source sentinel is needed and the order is not a draw order.
+    pub fn created_handles(&self) -> impl Iterator<Item = Handle> + '_ {
+        self.copies.iter().map(|&(_, new)| new).chain(self.generated.iter().copied())
+    }
     pub fn copied_entities(&self) -> &[(Handle, Handle)] { &self.top_level_copies }
     pub fn allocation_floor(&self) -> u64 { self.allocation_floor }
 }
@@ -165,6 +181,7 @@ struct Graph {
     edges: Vec<Edge>,
     top_members: HashMap<Handle, Handle>,
     shared_definitions: HashSet<Handle>,
+    protected_table_refs: HashSet<Handle>,
     block_names: HashMap<Handle, String>,
     entity_dictionaries: HashMap<Handle, Handle>,
     nested_parent: HashMap<Handle, Handle>,
@@ -375,7 +392,12 @@ impl Graph {
         {
             return Err(unsupported("document has opaque or unsupported side-channel data"));
         }
-        let mut g = Self { floor: doc.next_handle.max(doc.header.handle_seed), ..Self::default() };
+        let (table_max, protected_table_refs) =
+            super::handle_usage::native_edit_table_protection(doc)
+                .map_err(|_| unsupported("unqualified header or symbol-table references"))?;
+        let floor = table_max.checked_add(1).ok_or(NativeEditError::HandleOverflow)?
+            .max(doc.next_handle).max(doc.header.handle_seed).max(1);
+        let mut g = Self { floor, protected_table_refs, ..Self::default() };
         macro_rules! table {
             ($t:expr) => {{
                 let t = &$t;
@@ -573,7 +595,15 @@ fn remap(h: Handle, mapping: &HashMap<Handle, Handle>) -> Handle {
 fn remap_common(c: &mut EntityCommon, mapping: &HashMap<Handle, Handle>) {
     c.handle = remap(c.handle, mapping);
     c.owner_handle = remap(c.owner_handle, mapping);
-    c.xdictionary_handle = c.xdictionary_handle.map(|h| remap(h, mapping));
+    // Keep every typed common reference consistent with the same map.
+    for reference in [
+        &mut c.layer_handle, &mut c.linetype_handle, &mut c.color_book_handle,
+        &mut c.full_visual_style_handle, &mut c.face_visual_style_handle,
+        &mut c.edge_visual_style_handle, &mut c.material_handle,
+        &mut c.plotstyle_handle, &mut c.xdictionary_handle,
+    ] {
+        if let Some(h) = reference { *h = remap(*h, mapping); }
+    }
     for h in &mut c.reactors { *h = remap(*h, mapping); }
     c.raw_record = None;
 }
@@ -594,6 +624,9 @@ impl CadDocument {
         if handles.is_empty() { return Ok(NativeChange::default()); }
         let graph = Graph::build(self)?;
         let doomed = graph.closure(self, handles)?;
+        if doomed.iter().any(|h| graph.protected_table_refs.contains(h)) {
+            return Err(unsupported("header or symbol-table reference requires specialized removal"));
+        }
         for e in &graph.edges {
             if doomed.contains(&e.target) && !doomed.contains(&e.source)
                 && e.kind == EdgeKind::Reference {
@@ -728,6 +761,8 @@ impl CadDocument {
         let mut other: Vec<_> = closure.iter().copied().filter(|h| !seen.contains(h)).collect();
         other.sort_by_key(|h| h.value());
         order.extend(other);
+        // Header/table references also reserve their numeric slots even if
+        // dangling; do not make a new copy accidentally satisfy such a link.
         let mut next = graph.floor;
         let mut mapping = HashMap::with_capacity(order.len());
         let mut change = NativeChange::default();
@@ -756,8 +791,10 @@ impl CadDocument {
                 if let Some(seqend) = i.seqend_handle {
                     i.seqend_handle = Some(remap(seqend, &mapping));
                 } else if !i.attributes.is_empty() {
-                    i.seqend_handle = Some(Handle::new(next));
+                    let generated = Handle::new(next);
                     next = next.checked_add(1).ok_or(NativeEditError::HandleOverflow)?;
+                    i.seqend_handle = Some(generated);
+                    change.generated.push(generated);
                 }
                 let definition = self.block_records.get(&i.block_name)
                     .ok_or(unsupported("missing block definition"))?;
@@ -908,7 +945,14 @@ impl CadDocument {
             }
         }
         for h in &added {
-            if graph.identities.contains(h) { return Err(NativeEditError::Conflict(*h)); }
+            if graph.identities.contains(h) || graph.protected_table_refs.contains(h) {
+                return Err(NativeEditError::Conflict(*h));
+            }
+        }
+        for h in &removed {
+            if graph.protected_table_refs.contains(h) {
+                return Err(NativeEditError::Conflict(*h));
+            }
         }
         // The caller must use history order. Additionally refuse fresh
         // dependencies on records about to be removed, and unexpected
@@ -1130,6 +1174,68 @@ mod tests {
         assert_eq!(doc.objects.len(), old_objects + 4);
         assert_eq!(doc.block_records.get("B").unwrap().insert_handles.iter().filter(|h| **h == fresh).count(), 1);
         assert!(doc.next_handle() >= floor);
+    }
+
+    #[test]
+    fn generated_seqends_are_reported_without_fake_source_handles() {
+        let mut doc = CadDocument::new();
+        let mut definition = BlockRecord::new("SEQEND_TEST");
+        definition.handle = doc.allocate_handle();
+        doc.block_records.add(definition).unwrap();
+
+        let mut sources = Vec::new();
+        for _ in 0..2 {
+            let mut insert = Insert::new("SEQEND_TEST", Vector3::ZERO);
+            insert.common.handle = doc.allocate_handle();
+            let source = insert.common.handle;
+            let mut attribute = AttributeEntity::simple("TAG", "VALUE");
+            attribute.common.handle = doc.allocate_handle();
+            attribute.common.owner_handle = source;
+            insert.attributes.push(attribute);
+            assert!(insert.seqend_handle.is_none());
+            assert_eq!(doc.add_entity(EntityType::Insert(insert)).unwrap(), source);
+            sources.push(source);
+        }
+        let change = doc.copy_entities(&sources).unwrap();
+        assert_eq!(change.copied_entities().len(), 2);
+        assert_eq!(change.copied_handles().len(), 4);
+        assert!(change.copied_handles().iter().all(|(old, _)| !old.is_null()));
+        assert_eq!(change.generated_handles().len(), 2);
+        let created: HashSet<_> = change.created_handles().collect();
+        assert_eq!(created.len(), 6);
+
+        let seqends: Vec<_> = change.copied_entities().iter().map(|&(source, copied)| {
+            let original = match doc.get_entity(source).unwrap() {
+                EntityType::Insert(i) => i,
+                _ => panic!("expected source insert"),
+            };
+            assert!(original.seqend_handle.is_none());
+            let output = match doc.get_entity(copied).unwrap() {
+                EntityType::Insert(i) => i,
+                _ => panic!("expected copied insert"),
+            };
+            let seqend = output.seqend_handle.expect("generated SEQEND");
+            assert!(created.contains(&seqend));
+            assert!(change.generated_handles().contains(&seqend));
+            (copied, seqend)
+        }).collect();
+
+        let floor = doc.next_handle();
+        doc.restore_entities(&change).unwrap();
+        for &(copied, _) in &seqends {
+            assert!(doc.get_entity(copied).is_none());
+        }
+        let allocated = doc.allocate_handle();
+        assert!(allocated.value() >= floor);
+        assert!(!created.contains(&allocated));
+        doc.redo_native_change(&change).unwrap();
+        for (copied, seqend) in seqends {
+            let output = match doc.get_entity(copied).unwrap() {
+                EntityType::Insert(i) => i,
+                _ => panic!("expected restored copy"),
+            };
+            assert_eq!(output.seqend_handle, Some(seqend));
+        }
     }
 
     #[test]

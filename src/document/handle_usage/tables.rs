@@ -500,8 +500,8 @@ pub(super) fn visit(d: &CadDocument, u: &mut HandleUsage) -> Result<()> {
             base_point: _,
         } = v;
         u.protect(v.layout);
-        u.refs(&v.entity_handles);
-        u.refs(&v.insert_handles);
+        u.member_refs(&v.entity_handles);
+        u.member_refs(&v.insert_handles);
         for (marker, end) in [(v.block_entity_handle, false), (v.block_end_handle, true)] {
             if !marker.is_null() {
                 u.primary(marker, "block_record.marker")?;

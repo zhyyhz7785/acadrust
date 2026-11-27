@@ -4,7 +4,7 @@ use crate::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
 pub(super) fn xdata(x: &ExtendedData, u: &mut HandleUsage) -> Result<()> {
     x.reservation_fields();
     if !x.raw_dwg_eed.is_empty() {
-        return Err(u.unsupported("extended_data.raw_dwg_eed"));
+        u.inspect_unqualified_storage("extended_data.raw_dwg_eed")?;
     }
     for r in x.records() {
         let ExtendedDataRecord {
@@ -66,16 +66,16 @@ fn common(c: &EntityCommon, u: &mut HandleUsage) -> Result<()> {
     } = c;
 
     if c.raw_record.is_some() {
-        return Err(u.unsupported("common.raw_record"));
+        u.inspect_unqualified_storage("common.raw_record")?;
     }
     if c.graphic_data.is_some() {
-        return Err(u.unsupported("common.graphic_data"));
+        u.inspect_unqualified_storage("common.graphic_data")?;
     }
     if c.r12_metadata.is_some() {
-        return Err(u.unsupported("common.r12_metadata"));
+        u.inspect_unqualified_storage("common.r12_metadata")?;
     }
     if c.has_ds_data {
-        return Err(u.unsupported("common.has_ds_data"));
+        u.inspect_unqualified_storage("common.has_ds_data")?;
     }
 
     u.optional(c.layer_handle);
@@ -128,13 +128,15 @@ fn attribute(v: &AttributeEntity, u: &mut HandleUsage, inline: bool) -> Result<(
     u.protect(v.attdef_handle);
     u.text(&v.value, "attribute.value")
 }
-fn boundary(p: &BoundaryPath, u: &mut HandleUsage) {
+fn boundary(p: &BoundaryPath, u: &mut HandleUsage, list: NativeHatchBoundaryList, path: usize) {
     let BoundaryPath {
         flags: _,
         edges: _,
         boundary_handles: _,
     } = p;
-    u.refs(&p.boundary_handles);
+    for (slot, &h) in p.boundary_handles.iter().enumerate() {
+        u.protect_role(h, NativeReferenceRole::HatchBoundary { list, path, slot });
+    }
     for e in &p.edges {
         match e {
             BoundaryEdge::Line(_)
@@ -152,14 +154,14 @@ pub(super) fn hatch_context(h: &crate::objects::HatchScaleContext, u: &mut Handl
         pattern_base: _,
         loops: _,
     } = h;
-    for l in &h.loops {
+    for (path, l) in h.loops.iter().enumerate() {
         let crate::objects::HatchLoopContext {
             loop_type: _,
             supports_context: _,
             boundary: _,
         } = l;
         if let Some(p) = &l.boundary {
-            boundary(p, u);
+            boundary(p, u, NativeHatchBoundaryList::AnnotationContext, path);
         }
     }
 }
@@ -469,8 +471,11 @@ pub(super) fn visit(e: &EntityType, u: &mut HandleUsage) -> Result<()> {
                 mpolygon_x_direction: _,
                 mpolygon_invalid_loops: _,
             } = v.as_ref();
-            for p in v.paths.iter().chain(v.mpolygon_invalid_loops.iter()) {
-                boundary(p, u);
+            for (path, p) in v.paths.iter().enumerate() {
+                boundary(p, u, NativeHatchBoundaryList::Paths, path);
+            }
+            for (path, p) in v.mpolygon_invalid_loops.iter().enumerate() {
+                boundary(p, u, NativeHatchBoundaryList::InvalidMPolygonLoops, path);
             }
         }
         EntityType::Solid(v) => {
@@ -630,8 +635,46 @@ pub(super) fn visit(e: &EntityType, u: &mut HandleUsage) -> Result<()> {
         EntityType::Face3D(_) => return Err(u.unsupported("entity.Face3D")),
         EntityType::Ray(_) => return Err(u.unsupported("entity.Ray")),
         EntityType::XLine(_) => return Err(u.unsupported("entity.XLine")),
-        EntityType::Leader(_) => return Err(u.unsupported("entity.Leader")),
-        EntityType::MultiLeader(_) => return Err(u.unsupported("entity.MultiLeader")),
+        EntityType::Leader(v) => {
+            if u.diagnostic() {
+                u.protect_role(v.annotation_handle, NativeReferenceRole::LeaderAnnotation);
+            }
+            return Err(u.unsupported("entity.Leader"));
+        }
+        EntityType::MultiLeader(v) => {
+            if u.diagnostic() {
+                for (field, handle) in [
+                    (NativeMLeaderField::Style, v.style_handle),
+                    (NativeMLeaderField::LineType, v.line_type_handle),
+                    (NativeMLeaderField::Arrowhead, v.arrowhead_handle),
+                    (NativeMLeaderField::TextStyle, v.text_style_handle),
+                    (NativeMLeaderField::BlockContent, v.block_content_handle),
+                    (NativeMLeaderField::ContextTextStyle, v.context.text_style_handle),
+                    (NativeMLeaderField::ContextBlockContent, v.context.block_content_handle),
+                    (NativeMLeaderField::ContextScale, v.context.scale_handle),
+                ] {
+                    u.optional_role(handle, NativeReferenceRole::MLeaderField(field));
+                }
+                for (root, r) in v.context.leader_roots.iter().enumerate() {
+                    for (line, l) in r.lines.iter().enumerate() {
+                        u.optional_role(l.line_type_handle, NativeReferenceRole::MLeaderLine {
+                            root, line, field: NativeMLeaderField::LineOverrideType,
+                        });
+                        u.optional_role(l.arrowhead_handle, NativeReferenceRole::MLeaderLine {
+                            root, line, field: NativeMLeaderField::LineOverrideArrowhead,
+                        });
+                    }
+                }
+                for (index, a) in v.block_attributes.iter().enumerate() {
+                    u.optional_role(a.attribute_definition_handle, NativeReferenceRole::MLeaderAttribute { index });
+                }
+                for (index, a) in v.arrowhead_overrides.iter().enumerate() {
+                    u.optional_role(a.arrowhead_handle, NativeReferenceRole::MLeaderArrowOverride { index });
+                }
+            }
+            // Captured fields are not exhaustive qualification.
+            return Err(u.unsupported("entity.MultiLeader"));
+        }
         EntityType::Mesh(_) => return Err(u.unsupported("entity.Mesh")),
         EntityType::RasterImage(_) => return Err(u.unsupported("entity.RasterImage")),
         EntityType::Solid3D(_) => return Err(u.unsupported("entity.Solid3D")),

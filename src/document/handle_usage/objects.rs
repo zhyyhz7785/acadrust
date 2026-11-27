@@ -549,6 +549,13 @@ pub(super) fn visit(key: Handle, o: &ObjectType, u: &mut HandleUsage) -> Result<
             u.primary(key, "objects.handle")?;
             u.protect(v.owner_handle);
             u.protect(v.block_owner_handle);
+            // Observe known member slots even when raw backing is present.
+            // A sort_handle is an ordering key, not an incoming CAD edge.
+            if u.diagnostic() {
+                for (index, entry) in v.entries().enumerate() {
+                    u.protect_role(entry.entity_handle, NativeReferenceRole::SortMember { index });
+                }
+            }
             v.reservation_inspect(u)?;
         }
         ObjectType::DictionaryVariable(v) => {
@@ -622,9 +629,9 @@ pub(super) fn visit(key: Handle, o: &ObjectType, u: &mut HandleUsage) -> Result<
                         dimension: _,
                         references: _,
                     } = a;
-                    u.protect(a.dimension);
-                    for chain in &a.references {
-                        for r in chain {
+                    u.protect_role(a.dimension, NativeReferenceRole::DimensionAssociation);
+                    for (slot, references) in a.references.iter().enumerate() {
+                        for (chain, r) in references.iter().enumerate() {
                             let AssocDimensionReference {
                                 class_name: _,
                                 osnap_type: _,
@@ -640,8 +647,16 @@ pub(super) fn visit(key: Handle, o: &ObjectType, u: &mut HandleUsage) -> Result<
                                 intersection_xref_paths: _,
                                 has_last_point_reference: _,
                             } = r;
-                            u.refs(&r.xrefs);
-                            u.refs(&r.intersection_objects);
+                            for (index, &h) in r.xrefs.iter().enumerate() {
+                                u.protect_role(h, NativeReferenceRole::DimensionSnap {
+                                    slot, chain, intersection: false, index,
+                                });
+                            }
+                            for (index, &h) in r.intersection_objects.iter().enumerate() {
+                                u.protect_role(h, NativeReferenceRole::DimensionSnap {
+                                    slot, chain, intersection: true, index,
+                                });
+                            }
                         }
                     }
                 }
@@ -735,7 +750,14 @@ pub(super) fn visit(key: Handle, o: &ObjectType, u: &mut HandleUsage) -> Result<
                 }
             }
         }
-        ObjectType::Group(_) => return Err(u.unsupported("object.Group")),
+        ObjectType::Group(v) => {
+            if u.diagnostic() {
+                for (index, &h) in v.entities.iter().enumerate() {
+                    u.protect_role(h, NativeReferenceRole::GroupMember { index });
+                }
+            }
+            return Err(u.unsupported("object.Group"));
+        }
         ObjectType::ImageDefinition(_) => return Err(u.unsupported("object.ImageDefinition")),
         ObjectType::UnderlayDefinition(_) => return Err(u.unsupported("object.UnderlayDefinition")),
         ObjectType::TableContent(_) => return Err(u.unsupported("object.TableContent")),
@@ -760,7 +782,18 @@ pub(super) fn visit(key: Handle, o: &ObjectType, u: &mut HandleUsage) -> Result<
         ObjectType::FieldList(_) => return Err(u.unsupported("object.FieldList")),
         ObjectType::RegisteredClass(_) => return Err(u.unsupported("object.RegisteredClass")),
         ObjectType::DgnLineStyle(_) => return Err(u.unsupported("object.DgnLineStyle")),
-        ObjectType::ProxyObject(_) => return Err(u.unsupported("object.ProxyObject")),
+        ObjectType::ProxyObject(v) => {
+            if u.diagnostic() {
+                u.protect(v.owner);
+                u.refs(&v.reactors);
+                u.optional(v.xdictionary_handle);
+                for (index, reference) in v.object_ids.iter().enumerate() {
+                    u.protect_role(reference.handle, NativeReferenceRole::ProxyObjectId { index });
+                }
+            }
+            // Explicit object IDs do not qualify the proxy payload.
+            return Err(u.unsupported("object.ProxyObject"));
+        }
         ObjectType::Arch(_) => return Err(u.unsupported("object.Arch")),
         ObjectType::Unknown { .. } => return Err(u.unsupported("object.Unknown")),
     }

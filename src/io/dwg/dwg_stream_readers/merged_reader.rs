@@ -21,6 +21,28 @@ use crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
 use crate::io::dwg::dwg_version::DwgVersion;
 use crate::types::{Color, DxfVersion, Vector2, Vector3};
 
+/// One strictly decoded slot in the independently framed DWG handle stream.
+/// The original nibble is retained; relative forms do not establish a
+/// pointer/ownership policy without knowing the containing field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawHandleStreamSlot {
+    pub bit_offset: i64,
+    pub code: u8,
+    pub handle: u64,
+}
+
+/// Observations limited to the separate handle stream, not the inline data,
+/// text stream, EED or application payload. Trailing bits are reported, not
+/// assumed to be harmless padding.
+#[derive(Debug)]
+pub struct RawHandleStreamInspection {
+    pub type_code: i16,
+    pub stream_start_bit: i64,
+    pub slots: Vec<RawHandleStreamSlot>,
+    pub trailing_bits: u8,
+    pub trailing_value: u8,
+}
+
 /// Merge mode, determined by DWG version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MergeMode {
@@ -603,6 +625,38 @@ impl DwgMergedReader {
                 (h, ref_type)
             }
         }
+    }
+
+    /// Scan a separately framed handle stream before any slots have been
+    /// consumed. Unknown or invalid forms fail atomically with no partial
+    /// result. This is diagnostic, not used by normal drawing decoding.
+    pub(crate) fn inspect_raw_handle_slots(
+        &mut self,
+        type_code: i16,
+        reference_handle: u64,
+    ) -> crate::error::Result<RawHandleStreamInspection> {
+        use crate::error::DxfError;
+        self.check_error()?;
+        let stream_start_bit = self.handle_start_bit;
+        let reader = self.handle.as_mut().ok_or_else(||
+            DxfError::Parse("DWG record has no independent handle reader".into()))?;
+        if reader.position_in_bits() != stream_start_bit {
+            return Err(DxfError::Parse("Handle stream was already consumed".into()));
+        }
+        let mut slots = Vec::new();
+        while reader.remaining_bits() >= 8 {
+            let bit_offset = reader.position_in_bits();
+            let (code, handle) = reader.read_checked_handle_slot(reference_handle)?;
+            slots.push(RawHandleStreamSlot { bit_offset, code, handle });
+        }
+        reader.check_error()?;
+        let trailing_bits = reader.remaining_bits() as u8;
+        let mut trailing_value = 0u8;
+        for _ in 0..trailing_bits {
+            trailing_value = (trailing_value << 1) | u8::from(reader.read_bit());
+        }
+        reader.check_error()?;
+        Ok(RawHandleStreamInspection { type_code, stream_start_bit, slots, trailing_bits, trailing_value })
     }
 
     /// Read a handle reference using the current object's handle as the base
