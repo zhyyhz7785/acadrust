@@ -32,6 +32,38 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+/// Detached handle reservation state for the HY3D editing facade.
+/// Contains no drawing tables, objects, geometry or history. Reserving or
+/// issuing a handle here does not mutate an existing CadDocument.
+#[derive(Clone, Copy, Debug)]
+pub struct CadHandleAllocator {
+    next: u64,
+}
+
+impl CadHandleAllocator {
+    /// Effective next handle, including HANDSEED reservations.
+    pub fn next_handle(&self) -> u64 {
+        self.next
+    }
+
+    /// Raise the next handle without issuing it or rolling the counter back.
+    pub fn reserve_next(&mut self, next: u64) {
+        self.next = self.next.max(next.max(1));
+    }
+
+    pub fn allocate_handle(&mut self) -> Handle {
+        issue_handle(&mut self.next)
+    }
+}
+
+// Both the native document and its detached reservation state use the same
+// issuance rule. The document additionally synchronizes its persisted header.
+fn issue_handle(next: &mut u64) -> Handle {
+    let handle = Handle::new(*next);
+    *next += 1;
+    handle
+}
+
 #[cfg(test)]
 #[path = "document/evaluated_block_tests.rs"]
 mod evaluated_block_tests;
@@ -2285,11 +2317,20 @@ impl CadDocument {
         if self.header.handle_seed > self.next_handle {
             self.next_handle = self.header.handle_seed;
         }
-        let handle = Handle::new(self.next_handle);
-        self.next_handle += 1;
+        let handle = issue_handle(&mut self.next_handle);
         // Keep HANDSEED in sync — DWG header requires this to be ≥ next_handle
         self.header.handle_seed = self.next_handle;
         handle
+    }
+
+    /// Copy the effective high-water mark without cloning any drawing data.
+    /// This is a detached reservation state, not a second native document.
+    /// The caller must reconcile reservations with the actual document before
+    /// inserting entities into it.
+    pub fn detached_handle_allocator(&self) -> CadHandleAllocator {
+        CadHandleAllocator {
+            next: self.next_handle.max(self.header.handle_seed),
+        }
     }
 
     /// Advance the allocator above every stored record identity.
