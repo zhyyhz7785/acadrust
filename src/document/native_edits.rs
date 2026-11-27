@@ -1,9 +1,11 @@
 //! Exact, scoped entity-graph edits without a whole-document snapshot.
 //!
 //! The initial coverage is deliberately limited to fully typed, in-memory
-//! documents. Opaque imports, unknown reference-bearing types, and ambiguous
-//! ownership are rejected before mutation. This module does not claim that
-//! all CAD relationships are represented by the supported graph.
+//! documents with valid symbol-table/header references. Opaque DWG imports,
+//! unknown reference-bearing types, and ambiguous ownership are rejected
+//! before mutation. The reference scanner is not an exhaustive audit of every
+//! symbol-table/header field. This module is a contribution candidate, not a
+//! complete replacement for general CAD editing or imported-drawing ERASE.
 
 use super::{CadDocument, EntityCommon, EntityType, Handle, ObjectType, TableEntry};
 use crate::objects::XRecordValue;
@@ -164,6 +166,7 @@ struct Graph {
     top_members: HashMap<Handle, Handle>,
     shared_definitions: HashSet<Handle>,
     block_names: HashMap<Handle, String>,
+    entity_dictionaries: HashMap<Handle, Handle>,
     nested_parent: HashMap<Handle, Handle>,
     floor: u64,
 }
@@ -238,7 +241,8 @@ impl Graph {
             EntityType::Point(_) | EntityType::Line(_) | EntityType::Circle(_)
             | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::LwPolyline(_)
             | EntityType::Solid(_) | EntityType::Face3D(_) | EntityType::Ray(_)
-            | EntityType::XLine(_) => {}
+            | EntityType::XLine(_) | EntityType::BlockEnd(_) => {}
+            EntityType::Block(b) if b.xref_path.is_empty() => {}
             EntityType::Text(t) if !t.value.contains("%<") => {}
             EntityType::MText(t) if !t.is_annotative && !t.value.contains("%<") => {}
             EntityType::AttributeDefinition(a)
@@ -385,12 +389,22 @@ impl Graph {
         table!(doc.dim_styles); table!(doc.app_ids); table!(doc.views);
         table!(doc.vports); table!(doc.ucss); table!(doc.vx_table); table!(doc.block_records);
         g.shared_definitions.extend(g.identities.iter().copied());
+        let mut markers = HashMap::new();
         for b in doc.block_records.iter() {
             if g.block_names.insert(b.handle, b.name.clone()).is_some() {
                 return Err(NativeEditError::Conflict(b.handle));
             }
-            if !b.block_entity_handle.is_null() { g.identity(b.block_entity_handle)?; }
-            if !b.block_end_handle.is_null() { g.identity(b.block_end_handle)?; }
+            for (handle, is_begin) in [(b.block_entity_handle, true), (b.block_end_handle, false)] {
+                if handle.is_null() { continue; }
+                if markers.insert(handle, (b.handle, is_begin)).is_some() {
+                    return Err(NativeEditError::Conflict(handle));
+                }
+                if doc.get_entity(handle).is_none() {
+                    // New documents can have structural handles without a
+                    // corresponding flat BLOCK/ENDBLK record.
+                    g.identity(handle)?;
+                }
+            }
             if b.flags.is_xref || b.flags.is_xref_overlay {
                 return Err(unsupported("external block"));
             }
@@ -419,10 +433,18 @@ impl Graph {
         }
         for (index, entity) in doc.entities.iter().enumerate() {
             let h = entity.common().handle;
-            if doc.entity_index.get(&h) != Some(&index)
-                || g.top_members.get(&h) != Some(&entity.common().owner_handle) {
+            if doc.entity_index.get(&h) != Some(&index) {
                 return Err(NativeEditError::Conflict(h));
             }
+            let membership_ok = match entity.as_ref() {
+                EntityType::Block(_) => markers.get(&h) == Some(&(entity.common().owner_handle, true))
+                    && !g.top_members.contains_key(&h),
+                EntityType::BlockEnd(_) => markers.get(&h) == Some(&(entity.common().owner_handle, false))
+                    && !g.top_members.contains_key(&h),
+                _ => !markers.contains_key(&h)
+                    && g.top_members.get(&h) == Some(&entity.common().owner_handle),
+            };
+            if !membership_ok { return Err(NativeEditError::Conflict(h)); }
             g.entity(doc, entity.as_ref())?;
         }
         for (h, object) in &doc.objects {
@@ -468,11 +490,28 @@ impl Graph {
                 common.extend(i.attributes.iter().map(|a| &a.common));
             }
             for c in common {
-                if let Some(dictionary) = c.xdictionary_handle {
+                let side = doc.xdic_by_handle.get(&c.handle).copied();
+                if c.xdictionary_handle.is_some() && side.is_some() && c.xdictionary_handle != side {
+                    return Err(unsupported("inconsistent extension dictionary references"));
+                }
+                let dictionary = match c.xdictionary_handle.or(side) {
+                    Some(h) => Some(h),
+                    None => {
+                        let mut owned = g.children.get(&c.handle).into_iter().flatten().copied()
+                            .filter(|h| matches!(doc.objects.get(h), Some(ObjectType::Dictionary(_))));
+                        let first = owned.next();
+                        if owned.next().is_some() {
+                            return Err(unsupported("ambiguous entity extension dictionary"));
+                        }
+                        first
+                    }
+                };
+                if let Some(dictionary) = dictionary {
                     if doc.object_owner(dictionary) != Some(c.handle)
                         || !matches!(doc.objects.get(&dictionary), Some(ObjectType::Dictionary(_))) {
                         return Err(unsupported("invalid entity extension dictionary"));
                     }
+                    g.entity_dictionaries.insert(c.handle, dictionary);
                 }
             }
         }
@@ -488,8 +527,11 @@ impl Graph {
         let mut result = HashSet::new();
         let mut pending = roots.to_vec();
         for h in roots {
-            if doc.get_entity(*h).is_none() {
-                return Err(NativeEditError::Missing(*h));
+            match doc.get_entity(*h) {
+                None => return Err(NativeEditError::Missing(*h)),
+                Some(EntityType::Block(_) | EntityType::BlockEnd(_)) =>
+                    return Err(unsupported("structural block markers cannot be edited as entities")),
+                Some(_) => {}
             }
         }
         while let Some(h) = pending.pop() {
@@ -700,11 +742,15 @@ impl CadDocument {
         for old in roots {
             let source = self.get_entity(old).ok_or(NativeEditError::Missing(old))?;
             let mut copy = source.clone();
+            let dictionary = graph.entity_dictionaries.get(&old).copied();
             remap_common(copy.common_mut(), &mapping);
+            copy.common_mut().xdictionary_handle = dictionary.map(|h| remap(h, &mapping));
             let new = copy.common().handle;
             if let EntityType::Insert(i) = &mut copy {
                 for a in &mut i.attributes {
+                    let dictionary = graph.entity_dictionaries.get(&a.common.handle).copied();
                     remap_common(&mut a.common, &mapping);
+                    a.common.xdictionary_handle = dictionary.map(|h| remap(h, &mapping));
                     a.attdef_handle = remap(a.attdef_handle, &mapping);
                 }
                 if let Some(seqend) = i.seqend_handle {
@@ -952,5 +998,187 @@ impl CadDocument {
             *member_slice_mut(block, kind) = value;
         }
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{AttributeEntity, Block, BlockEnd, Insert, Line};
+    use crate::tables::BlockRecord;
+    use crate::types::{Color, DxfVersion, Vector3};
+
+    fn line(doc: &mut CadDocument) -> Handle {
+        doc.add_entity(EntityType::Line(Line::from_coords(
+            0.0, 0.0, 0.0, 1.0, 2.0, 0.0,
+        ))).unwrap()
+    }
+
+    #[test]
+    fn remove_restores_owned_records_and_both_reactor_representations() {
+        let mut doc = CadDocument::new();
+        let target = line(&mut doc);
+        let survivor = line(&mut doc);
+        let record = doc.ensure_xrecord(target, "PAYLOAD");
+        let dictionary = doc.extension_dictionary_handle(target).unwrap();
+        doc.xrecord_mut(target, "PAYLOAD").unwrap().add_string(1, "kept");
+        doc.get_entity_mut(survivor).unwrap().common_mut().reactors.push(target);
+        let owner = doc.header.model_space_block_handle;
+        doc.add_object_reactor(owner, target);
+        let old_objects = doc.objects.len();
+        let old_members = doc.block_records.get("*Model_Space").unwrap().entity_handles.clone();
+        let old_seed = doc.header.handle_seed;
+        let change = doc.remove_entities(&[target, target]).unwrap();
+        assert_eq!(doc.entity_count(), 1);
+        assert!(doc.get_entity(target).is_none());
+        assert!(!doc.objects.contains_key(&record));
+        assert!(!doc.objects.contains_key(&dictionary));
+        assert_eq!(doc.objects.len(), old_objects - 2);
+        assert!(doc.get_entity(survivor).unwrap().common().reactors.is_empty());
+        assert!(doc.object_reactors(owner).is_empty());
+        assert!(!doc.block_records.get("*Model_Space").unwrap().entity_handles.contains(&target));
+        doc.layers.get_mut("0").unwrap().color = Color::RED;
+        doc.source_path = Some("new-path.dwg".into());
+        doc.restore_entities(&change).unwrap();
+        assert_eq!(doc.objects.len(), old_objects);
+        assert_eq!(doc.extension_dictionary_handle(target), Some(dictionary));
+        assert_eq!(doc.xrecord(target, "PAYLOAD").unwrap().handle, record);
+        assert_eq!(doc.get_entity(survivor).unwrap().common().reactors, vec![target]);
+        assert_eq!(doc.object_reactors(owner), &[target]);
+        assert_eq!(doc.block_records.get("*Model_Space").unwrap().entity_handles, old_members);
+        assert_eq!(doc.layers.get("0").unwrap().color, Color::RED);
+        assert_eq!(doc.source_path.as_deref(), Some("new-path.dwg"));
+        assert!(doc.header.handle_seed >= old_seed);
+        doc.redo_native_change(&change).unwrap();
+        assert_eq!(doc.objects.len(), old_objects - 2);
+        assert!(doc.get_entity(target).is_none());
+        assert!(doc.allocate_handle().value() >= old_seed);
+    }
+
+    #[test]
+    fn deep_copy_insert_allocates_nested_handles_and_owned_dictionary_graph() {
+        let mut doc = CadDocument::new();
+        let mut definition = BlockRecord::new("B");
+        definition.handle = doc.allocate_handle();
+        let definition_handle = definition.handle;
+        doc.block_records.add(definition).unwrap();
+        let mut begin = Block::new("B", Vector3::ZERO);
+        begin.common.owner_handle = definition_handle;
+        let begin_handle = doc.add_entity(EntityType::Block(begin)).unwrap();
+        let mut end = BlockEnd::new();
+        end.common.owner_handle = definition_handle;
+        let end_handle = doc.add_entity(EntityType::BlockEnd(end)).unwrap();
+        {
+            let definition = doc.block_records.get_mut("B").unwrap();
+            definition.block_entity_handle = begin_handle;
+            definition.block_end_handle = end_handle;
+        }
+        let mut insert = Insert::new("B", Vector3::ZERO);
+        insert.common.handle = doc.allocate_handle();
+        let source = insert.common.handle;
+        let mut attribute = AttributeEntity::simple("TAG", "VALUE");
+        attribute.common.handle = doc.allocate_handle();
+        let child = attribute.common.handle;
+        attribute.common.owner_handle = source;
+        insert.attributes.push(attribute);
+        let sequence_end = doc.allocate_handle();
+        insert.seqend_handle = Some(sequence_end);
+        assert_eq!(doc.add_entity(EntityType::Insert(insert)).unwrap(), source);
+        let source_record = doc.ensure_xrecord(source, "PAYLOAD");
+        let source_dictionary = doc.extension_dictionary_handle(source).unwrap();
+        doc.xrecord_mut(source, "PAYLOAD").unwrap().add_handle(340, child);
+        let child_record = doc.ensure_xrecord(child, "ATTR_PAYLOAD");
+        let child_dictionary = doc.extension_dictionary_handle(child).unwrap();
+        let old_objects = doc.objects.len();
+
+        let change = doc.copy_entities_with(&[source, source], |_, copy| {
+            if let EntityType::Insert(i) = copy {
+                i.insert_point = Vector3::new(1.0, 2.0, 3.0);
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(change.copied_entities().len(), 1);
+        let fresh = change.copied_entities()[0].1;
+        let mapping: HashMap<_, _> = change.copied_handles().iter().copied().collect();
+        let output = match doc.get_entity(fresh).unwrap() {
+            EntityType::Insert(i) => i,
+            _ => panic!("expected insert"),
+        };
+        assert_eq!(output.insert_point, Vector3::new(1.0, 2.0, 3.0));
+        assert_ne!(fresh, source);
+        assert_eq!(output.attributes[0].common.handle, mapping[&child]);
+        assert_ne!(mapping[&child], child);
+        assert_eq!(output.attributes[0].common.owner_handle, fresh);
+        assert_eq!(output.seqend_handle, Some(mapping[&sequence_end]));
+        assert_eq!(output.attributes[0].common.xdictionary_handle, Some(mapping[&child_dictionary]));
+        assert_eq!(output.common.xdictionary_handle, Some(mapping[&source_dictionary]));
+        let copied_record = doc.xrecord(fresh, "PAYLOAD").unwrap();
+        assert_eq!(copied_record.handle, mapping[&source_record]);
+        assert_eq!(copied_record.entries[0].value.as_handle(), Some(mapping[&child]));
+        assert_eq!(doc.xrecord(source, "PAYLOAD").unwrap().entries[0].value.as_handle(), Some(child));
+        assert_eq!(doc.xrecord(mapping[&child], "ATTR_PAYLOAD").unwrap().handle, mapping[&child_record]);
+        assert_eq!(doc.objects.len(), old_objects + 4);
+        let floor = doc.next_handle();
+        doc.restore_entities(&change).unwrap();
+        assert!(doc.get_entity(fresh).is_none());
+        assert_eq!(doc.objects.len(), old_objects);
+        assert!(!doc.block_records.get("B").unwrap().insert_handles.contains(&fresh));
+        assert!(doc.next_handle() >= floor);
+        doc.redo_native_change(&change).unwrap();
+        assert!(doc.get_entity(fresh).is_some());
+        assert_eq!(doc.objects.len(), old_objects + 4);
+        assert_eq!(doc.block_records.get("B").unwrap().insert_handles.iter().filter(|h| **h == fresh).count(), 1);
+        assert!(doc.next_handle() >= floor);
+    }
+
+    #[test]
+    fn stale_replay_and_transform_failure_do_not_mutate_document() {
+        let mut doc = CadDocument::new();
+        let source = line(&mut doc);
+        let seed = doc.next_handle();
+        let error = doc.copy_entities_with(&[source], |_, copy| {
+            copy.common_mut().handle = Handle::new(999);
+            Ok(())
+        });
+        assert!(error.is_err());
+        assert_eq!(doc.entity_count(), 1);
+        assert_eq!(doc.next_handle(), seed);
+        let change = doc.copy_entity(source).unwrap();
+        let fresh = change.copied_entities()[0].1;
+        let owner = doc.header.model_space_block_handle;
+        doc.add_object_reactor(owner, fresh);
+        assert!(doc.restore_entities(&change).is_err());
+        assert_eq!(doc.entity_count(), 2);
+        assert_eq!(doc.object_reactors(owner), &[fresh]);
+    }
+
+    #[test]
+    fn opaque_import_is_rejected_without_partial_changes() {
+        let mut doc = CadDocument::new();
+        let target = line(&mut doc);
+        doc.dwg_source_version = Some(DxfVersion::AC1032);
+        let seed = doc.next_handle();
+        assert!(matches!(doc.remove_entities(&[target]), Err(NativeEditError::Unsupported(_))));
+        assert!(matches!(doc.copy_entity(target), Err(NativeEditError::Unsupported(_))));
+        assert!(doc.get_entity(target).is_some());
+        assert_eq!(doc.entity_count(), 1);
+        assert_eq!(doc.next_handle(), seed);
+    }
+
+    #[test]
+    fn ordered_member_patch_preserves_unremoved_members() {
+        let ids: Vec<_> = (1..=5).map(Handle::new).collect();
+        let patch = NativeMemberPatch {
+            owner: Handle::new(10),
+            kind: NativeMemberKind::Entity,
+            longer_len: ids.len(),
+            entries: vec![(1, ids[1]), (3, ids[3])],
+            add_forward: false,
+        };
+        let shorter = patch.replay(&ids, true).unwrap();
+        assert_eq!(shorter, vec![ids[0], ids[2], ids[4]]);
+        assert_eq!(patch.replay(&shorter, false).unwrap(), ids);
+        assert!(patch.replay(&[Handle::new(1)], false).is_err());
     }
 }
