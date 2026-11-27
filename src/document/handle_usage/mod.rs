@@ -14,6 +14,9 @@ pub(crate) struct HandleUsage {
     prefix: String,
     // Only enabled by the native-edit header/table preflight.
     table_refs: Option<HashSet<Handle>>,
+    // Opt-in diagnostic capture. Never enabled by allocation census.
+    candidate_refs: Option<Vec<Handle>>,
+    candidate_has_unqualified_storage: bool,
 }
 impl HandleUsage {
     fn new() -> Self {
@@ -24,10 +27,15 @@ impl HandleUsage {
             location: AuditLocation::Document,
             prefix: String::new(),
             table_refs: None,
+            candidate_refs: None,
+            candidate_has_unqualified_storage: false,
         }
     }
     pub(crate) fn protect(&mut self, h: Handle) {
         self.max = self.max.max(h.value());
+        if !h.is_null() {
+            if let Some(refs) = &mut self.candidate_refs { refs.push(h); }
+        }
         if let Some(refs) = &mut self.table_refs {
             if !h.is_null() {
                 refs.insert(h);
@@ -66,13 +74,30 @@ impl HandleUsage {
             field_path: format!("{}{}", self.prefix, path),
         }
     }
+    /// In diagnostic mode only, record the missing qualification and keep
+    /// walking modeled fields. The ordinary reservation path stays strict.
+    fn inspect_unqualified_storage(&mut self, path: &str) -> Result<()> {
+        if self.candidate_refs.is_some() {
+            self.candidate_has_unqualified_storage = true;
+            Ok(())
+        } else {
+            Err(self.unsupported(path))
+        }
+    }
+
     pub(crate) fn primary(&mut self, h: Handle, path: &str) -> Result<()> {
         if h.is_null() || self.identities.contains_key(&h) {
             return Err(self.bad(path, Some(h)));
         }
         self.identities
             .insert(h, (self.location.clone(), path.into()));
-        self.protect(h);
+        // An identity is a reservation, not evidence of an incoming edge.
+        // Preserve the existing table/census protection behavior.
+        if self.candidate_refs.is_some() {
+            self.max = self.max.max(h.value());
+        } else {
+            self.protect(h);
+        }
         Ok(())
     }
     pub(crate) fn text(&self, value: &str, path: &str) -> Result<()> {
@@ -91,6 +116,56 @@ pub(super) fn native_edit_table_protection(d: &CadDocument) -> Result<(u64, Hash
     usage.table_refs = Some(HashSet::new());
     tables::visit(d, &mut usage)?;
     Ok((usage.max, usage.table_refs.take().expect("table capture enabled")))
+}
+
+/// Numeric handle candidates obtained by the existing qualified field walker.
+/// This intentionally does NOT promise complete field/role information.
+/// A source can have candidates and an error at the same time. The scope of
+/// a source is the enclosing flat entity or object, including its inline
+/// children, so candidates are suitable for locating a record for inspection.
+pub(super) struct ReferenceCandidates<'a> {
+    pub targets: &'a [Handle],
+    pub unqualified_storage: bool,
+    pub error: Option<HandleReservationError>,
+}
+
+pub(super) fn visit_reference_candidates(
+    d: &CadDocument,
+    mut visitor: impl FnMut(Option<Handle>, ReferenceCandidates<'_>),
+) {
+    // Reuse the walker and identity scratch maps, not document records.
+    let mut usage = HandleUsage::new();
+    usage.candidate_refs = Some(Vec::new());
+    let mut finish = |usage: &mut HandleUsage, source, result: Result<()>| {
+        let mut targets = usage.candidate_refs.take().expect("diagnostic mode");
+        targets.sort_unstable_by_key(|h| h.value());
+        targets.dedup();
+        visitor(source, ReferenceCandidates {
+            targets: &targets,
+            unqualified_storage: usage.candidate_has_unqualified_storage,
+            error: result.err(),
+        });
+        targets.clear();
+        usage.candidate_refs = Some(targets);
+        usage.candidate_has_unqualified_storage = false;
+        usage.identities.clear();
+        usage.markers.clear();
+        usage.prefix.clear();
+        usage.max = 0;
+    };
+    let result = tables::visit(d, &mut usage);
+    finish(&mut usage, None, result);
+    for entity in &d.entities {
+        let handle = entity.common().handle;
+        usage.location = AuditLocation::Entity { handle };
+        let result = entities::visit(entity.as_ref(), &mut usage);
+        finish(&mut usage, Some(handle), result);
+    }
+    for (&handle, object) in &d.objects {
+        usage.location = AuditLocation::Object { handle };
+        let result = objects::visit(handle, object, &mut usage);
+        finish(&mut usage, Some(handle), result);
+    }
 }
 
 pub(super) fn census(d: &CadDocument) -> Result<u64> {
