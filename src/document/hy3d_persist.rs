@@ -46,7 +46,7 @@ struct Branch<K, V> {
 /// 仅供内核派生数据使用的子树摘要缓存。Weak 不保留旧几何；
 /// Arc::make_mut 会在存在 Weak 时换出被修改的节点，未修改子树仍可复用。
 /// 调用方必须在摘要所依赖的外部状态改变时丢弃整个缓存。
-pub(crate) struct CowFoldMemo<K, V, A> {
+pub struct CowFoldMemo<K, V, A> {
     nodes: std::collections::HashMap<usize, (std::sync::Weak<Node<K, V>>, A)>,
     root: Option<std::sync::Weak<Node<K, V>>>,
 }
@@ -58,7 +58,7 @@ impl<K, V, A> Default for CowFoldMemo<K, V, A> {
 }
 
 impl<K, V, A: Copy> CowFoldMemo<K, V, A> {
-    pub(crate) fn matches_root(&self, map: &CowMap<K, V>) -> bool {
+    pub fn matches_root(&self, map: &CowMap<K, V>) -> bool {
         match (&self.root, &map.root) {
             (None, None) => true,
             (Some(old), Some(now)) => old.as_ptr() == Arc::as_ptr(now),
@@ -66,7 +66,7 @@ impl<K, V, A: Copy> CowFoldMemo<K, V, A> {
         }
     }
 
-    pub(crate) fn fold(
+    pub fn fold(
         &mut self,
         map: &CowMap<K, V>,
         empty: A,
@@ -210,7 +210,7 @@ impl<K, V> CowMap<K, V> {
     }
 
     /// 内部历史捕获共享不可变记录；后续修改仍由 Arc::make_mut 隔离。
-    pub(crate) fn shared_record<Q>(&self, key: &Q) -> Option<&Arc<V>>
+    pub fn shared_record<Q>(&self, key: &Q) -> Option<&Arc<V>>
     where
         K: Ord + Borrow<Q>,
         Q: Ord + ?Sized,
@@ -898,7 +898,7 @@ impl<T> CowSeq<T> {
     }
 
     /// 内部快照可用根身份确认内容没有被写入，不改变通用 PartialEq 的值比较语义。
-    pub(crate) fn same_root(&self, other: &Self) -> bool {
+    pub fn same_root(&self, other: &Self) -> bool {
         match (&self.root, &other.root) {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right),
             (None, None) => true,
@@ -1297,6 +1297,47 @@ impl<'a, T> ExactSizeIterator for SeqIter<'a, T> {}
 
 fn owned_record<T: Clone>(arc: Arc<T>) -> T {
     Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
+}
+
+impl<K: Ord + Clone, V> CowMap<K, V> {
+    /// Build balanced nodes bottom-up from sorted, unique keys without
+    /// inserting each key separately. Only the root may be below half full.
+    /// The caller must supply strictly increasing keys.
+    pub(crate) fn from_sorted_unique(entries: Vec<(K, V)>) -> Self {
+        debug_assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let len = entries.len();
+        if len == 0 { return Self::new(); }
+        let mut entries = entries.into_iter();
+        let groups = len.div_ceil(FANOUT);
+        let mut level = Vec::with_capacity(groups);
+        for i in 0..groups {
+            let count = len / groups + usize::from(i < len % groups);
+            let mut keys = Vec::with_capacity(count);
+            let mut records = Vec::with_capacity(count);
+            for (key, value) in entries.by_ref().take(count) {
+                keys.push(key);
+                records.push(Arc::new(value));
+            }
+            level.push(Arc::new(Node::Leaf(Leaf { keys, records })));
+        }
+        while level.len() > 1 {
+            let count = level.len();
+            let groups = count.div_ceil(FANOUT);
+            let mut children = level.into_iter();
+            let mut next = Vec::with_capacity(groups);
+            for i in 0..groups {
+                let size = count / groups + usize::from(i < count % groups);
+                let mut branch = Branch {
+                    children: children.by_ref().take(size).collect(),
+                    keys: Vec::new(),
+                };
+                recompute_seps(&mut branch);
+                next.push(Arc::new(Node::Branch(branch)));
+            }
+            level = next;
+        }
+        Self { root: level.pop(), len }
+    }
 }
 
 impl<K, V> CowMap<K, V> {
