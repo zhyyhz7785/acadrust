@@ -302,6 +302,14 @@ pub(super) fn remove_record(document: &mut CadDocument, dictionary: &mut Diction
 /// Work only on an output copy. Saving must not add history/undo edits to the
 /// live document, and copied history nodes must not share mutable settings.
 pub(crate) fn prepared(document: &CadDocument) -> Cow<'_, CadDocument> {
+    let mut output = Cow::Borrowed(document);
+    prepare(&mut output);
+    output
+}
+
+/// The writer may already own an independent export document. Mutate
+/// that copy directly instead of cloning its native object tables again.
+pub(crate) fn prepare(document: &mut Cow<'_, CadDocument>) {
     let settings = document
         .objects
         .iter()
@@ -314,19 +322,19 @@ pub(crate) fn prepared(document: &CadDocument) -> Cow<'_, CadDocument> {
             else {
                 return None;
             };
-            (loft.parameters.is_some() || has_record(document, object.xdictionary_handle, KEY))
+            (loft.parameters.is_some() || has_record(document.as_ref(), object.xdictionary_handle, KEY))
                 .then(|| (*handle, loft.parameters.clone()))
         })
         .collect::<Vec<_>>();
     let legacy_histories = document.legacy_solid_history_entities();
     if settings.is_empty()
         && legacy_histories.is_empty()
-        && !super::loft_surface_curves::has_inputs(document)
-        && !super::surface_history::has_references(document)
+        && !super::loft_surface_curves::has_inputs(document.as_ref())
+        && !super::surface_history::has_references(document.as_ref())
     {
-        return Cow::Borrowed(document);
+        return;
     }
-    let mut output = document.clone();
+    let output = document.to_mut();
     for entity in legacy_histories {
         output.ensure_solid_history_evaluation_graph(entity);
     }
@@ -335,13 +343,13 @@ pub(crate) fn prepared(document: &CadDocument) -> Cow<'_, CadDocument> {
             Some(ObjectType::DynamicBlock(object)) => object.xdictionary_handle,
             _ => None,
         };
-        let mut dictionary = writable_dictionary(&mut output, node, previous);
+        let mut dictionary = writable_dictionary(output, node, previous);
         if let Some(ObjectType::DynamicBlock(object)) = output.objects.get_mut(&node) {
             object.xdictionary_handle = Some(dictionary.handle);
         }
         output.xdic_by_handle.insert(node, dictionary.handle);
         let Some(settings) = settings else {
-            remove_record(&mut output, &mut dictionary, KEY);
+            remove_record(output, &mut dictionary, KEY);
             output
                 .objects
                 .insert(dictionary.handle, ObjectType::Dictionary(dictionary));
@@ -372,9 +380,8 @@ pub(crate) fn prepared(document: &CadDocument) -> Cow<'_, CadDocument> {
             .objects
             .insert(dictionary.handle, ObjectType::Dictionary(dictionary));
     }
-    super::loft_surface_curves::store(&mut output);
-    super::surface_history::store(&mut output);
-    Cow::Owned(output)
+    super::loft_surface_curves::store(output);
+    super::surface_history::store(output);
 }
 
 pub(crate) fn restore(document: &mut CadDocument) {

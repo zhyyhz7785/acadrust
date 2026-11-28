@@ -61,20 +61,39 @@ impl DwgWriter {
     }
 
     /// Write a DWG file to any `Write + Seek` output.
-    pub fn write_to_writer<W: Write + Seek>(mut output: W, document: &CadDocument) -> Result<()> {
-        validate_unknown_records(document)?;
-        if document.version == DxfVersion::AC1009 {
-            let bytes = crate::io::dwg::r12::write_document(document)?;
+    pub fn write_to_writer<W: Write + Seek>(output: W, document: &CadDocument) -> Result<()> {
+        Self::write_to_writer_cow(output, &mut std::borrow::Cow::Borrowed(document))
+    }
+
+    /// Encode an already independent export document and return it, with
+    /// the writer's repairs applied. The caller owns the document even on
+    /// error and must not publish it unless encoding and durable install
+    /// both succeed. The borrowed public writer keeps its old behavior.
+    pub fn write_to_vec_owned(document: CadDocument) -> (Result<Vec<u8>>, CadDocument) {
+        let mut prepared = std::borrow::Cow::Owned(document);
+        let mut buffer = Cursor::new(Vec::new());
+        let result = Self::write_to_writer_cow(&mut buffer, &mut prepared)
+            .map(|()| buffer.into_inner());
+        (result, prepared.into_owned())
+    }
+
+    fn write_to_writer_cow<W: Write + Seek>(
+        mut output: W,
+        prepared: &mut std::borrow::Cow<'_, CadDocument>,
+    ) -> Result<()> {
+        validate_unknown_records(prepared.as_ref())?;
+        if prepared.version == DxfVersion::AC1009 {
+            let bytes = crate::io::dwg::r12::write_document(prepared.as_ref())?;
             output.write_all(&bytes)?;
             return Ok(());
         }
-        let mut prepared = crate::io::loft_parameters::prepared(document);
-        prepare_surface_classes(&mut prepared);
-        prepare_database_references(&mut prepared);
-        prepare_table_keys(&mut prepared);
-        prepare_active_viewport_elevation(&mut prepared);
-        prepare_roundtrip_records(&mut prepared);
-        prepare_book_colors(&mut prepared)?;
+        crate::io::loft_parameters::prepare(prepared);
+        prepare_surface_classes(prepared);
+        prepare_database_references(prepared);
+        prepare_table_keys(prepared);
+        prepare_active_viewport_elevation(prepared);
+        prepare_roundtrip_records(prepared);
+        prepare_book_colors(prepared)?;
         let document = prepared.as_ref();
         let perf = std::env::var_os("PERF").is_some();
         let started = web_time::Instant::now();
@@ -88,12 +107,13 @@ impl DwgWriter {
         // drawing. Assign fresh handles on a cloned document up front so
         // the controls, entries and handle map all agree (issue #51/#64
         // class of bug).
-        let mut owned;
-        let document: &CadDocument = if document.has_null_table_entries()
+        if document.has_null_table_entries()
             || document.version < DxfVersion::AC1027
             || has_missing_object_classes(document)
         {
-            owned = document.clone();
+            // Preparation may already own a document. Reuse that copy
+            // instead of deep-cloning its object tables a second time.
+            let owned = prepared.to_mut();
             if owned.has_null_table_entries() {
                 owned.assign_table_entry_handles();
             }
@@ -102,23 +122,21 @@ impl DwgWriter {
                 // for it, and the verbatim records copied from that file
                 // carry its class numbers: leave it as it is.
                 if owned.dwg_source_version != Some(owned.version) {
-                    prepare_legacy_classes(&mut owned);
+                    prepare_legacy_classes(owned);
                 }
             }
             // Objects added after reading (an evaluated dynamic block's
             // AcDbBlockRepresentationData, a drawing variable) need their
             // class whatever the version; the verbatim table only gains
             // entries at its end, so the numbers it carries stay valid.
-            add_missing_object_classes(&mut owned);
+            add_missing_object_classes(owned);
             if owned.version < DxfVersion::AC1027 {
-                prepare_legacy_document(&mut owned);
-                crate::objects::store_table_style_roundtrip(&mut owned);
-                crate::objects::store_visual_style_roundtrip(&mut owned);
+                prepare_legacy_document(owned);
+                crate::objects::store_table_style_roundtrip(owned);
+                crate::objects::store_visual_style_roundtrip(owned);
             }
-            &owned
-        } else {
-            document
-        };
+        }
+        let document = prepared.as_ref();
 
         let result = if uses_ac21_format(version) {
             write_ac21(&mut output, document, version)

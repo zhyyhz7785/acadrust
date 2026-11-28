@@ -102,7 +102,85 @@ pub struct Table<T: TableEntry> {
     handle: Handle,
 }
 
+/// Immutable export residue for table rows whose payload is owned elsewhere.
+/// Private keys and original positions are retained verbatim, including
+/// duplicate-name suffixes. The sparse table must not be sent to a writer.
+#[derive(Debug, Clone)]
+pub struct DetachedTableRows<R> {
+    original_len: usize,
+    rows: Vec<(usize, String, R)>,
+}
+
+impl<R> DetachedTableRows<R> {
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+}
+
 impl<T: TableEntry> Table<T> {
+    /// Split only rows explicitly accepted by capture. Keep all other rows,
+    /// their keys, the table handle and relative order unchanged.
+    pub fn detach_rows<R>(&mut self, mut capture: impl FnMut(&T) -> Option<R>) -> DetachedTableRows<R> {
+        let original_len = self.entries.len();
+        let mut rows = Vec::new();
+        let mut index = 0;
+        self.entries.retain(|key, entry| {
+            let slot = index;
+            index += 1;
+            if key_matches(key, entry.name()) {
+                if let Some(residue) = capture(entry) {
+                    rows.push((slot, key.clone(), residue));
+                    return false;
+                }
+            }
+            true
+        });
+        // No accepted row: keep the original allocation and hash table.
+        // Large reductions should release the original spare capacity.
+        if !rows.is_empty() && self.entries.capacity() > self.entries.len().saturating_mul(2) {
+            self.entries.shrink_to_fit();
+        }
+        DetachedTableRows { original_len, rows }
+    }
+
+    /// Restore into an independent sparse table copy before any encoding.
+    /// Validate identities and positions before changing the receiver.
+    pub fn rejoin_rows<R>(
+        &mut self, detached: &DetachedTableRows<R>, mut restore: impl FnMut(&R) -> T,
+    ) -> Result<(), DxfError> {
+        if self.entries.len().checked_add(detached.rows.len()) != Some(detached.original_len) {
+            return Err("Detached table row count mismatch".into());
+        }
+        if detached.rows.is_empty() { return Ok(()); }
+        let mut reconstructed = Vec::with_capacity(detached.rows.len());
+        let mut previous = None;
+        let mut keys = std::collections::HashSet::new();
+        for (index, key, residue) in &detached.rows {
+            let entry = restore(residue);
+            if *index >= detached.original_len || previous.is_some_and(|p| p >= *index)
+                || !key_matches(key, entry.name()) || self.entries.contains_key(key)
+                || !keys.insert(key.as_str())
+            {
+                return Err("Detached table row identity mismatch".into());
+            }
+            previous = Some(*index);
+            reconstructed.push((*index, key.clone(), entry));
+        }
+        let mut rebuilt = IndexMap::with_capacity(detached.original_len);
+        let mut remaining = std::mem::take(&mut self.entries).into_iter();
+        let mut restored = reconstructed.into_iter().peekable();
+        for index in 0..detached.original_len {
+            if restored.peek().is_some_and(|row| row.0 == index) {
+                let (_, key, entry) = restored.next().expect("validated detached row");
+                rebuilt.insert(key, entry);
+            } else {
+                let (key, entry) = remaining.next().expect("validated remaining row count");
+                rebuilt.insert(key, entry);
+            }
+        }
+        self.entries = rebuilt;
+        Ok(())
+    }
+
+
     /// Create a new empty table
     pub fn new() -> Self {
         Table {

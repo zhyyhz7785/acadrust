@@ -32,6 +32,44 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+/// Detached handle reservation state for the HY3D editing facade.
+/// Contains no drawing tables, objects, geometry or history. Reserving or
+/// issuing a handle here does not mutate an existing CadDocument.
+#[derive(Clone, Copy, Debug)]
+pub struct CadHandleAllocator {
+    next: u64,
+}
+
+impl CadHandleAllocator {
+    /// Start a detached logical handle sequence with no native table reservations.
+    /// The owning application must reconcile it with the native document on export.
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    /// Effective next handle, including HANDSEED reservations.
+    pub fn next_handle(&self) -> u64 {
+        self.next
+    }
+
+    /// Raise the next handle without issuing it or rolling the counter back.
+    pub fn reserve_next(&mut self, next: u64) {
+        self.next = self.next.max(next.max(1));
+    }
+
+    pub fn allocate_handle(&mut self) -> Handle {
+        issue_handle(&mut self.next)
+    }
+}
+
+// Both the native document and its detached reservation state use the same
+// issuance rule. The document additionally synchronizes its persisted header.
+fn issue_handle(next: &mut u64) -> Handle {
+    let handle = Handle::new(*next);
+    *next += 1;
+    handle
+}
+
 #[cfg(test)]
 #[path = "document/evaluated_block_tests.rs"]
 mod evaluated_block_tests;
@@ -82,6 +120,13 @@ fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture>
 mod dim_header;
 mod legacy_header;
 mod semantic_inventory;
+/// Shared persistent containers used by the enhanced native document and HY3D.
+pub mod hy3d_persist;
+/// Shared HY3D planar geometry payloads and native record operations.
+pub mod hy3d_geometry;
+mod entity_slots;
+use entity_slots::EntitySlots;
+use hy3d_persist::CowMap;
 pub(crate) use dim_header::{
     apply_dimension_arrow_header, dimension_arrow_dxf_name, sync_dimension_arrow_header,
 };
@@ -1236,6 +1281,25 @@ pub struct SummaryInfo {
     pub custom_properties: Vec<(String, String)>,
 }
 
+/// The original positions of modeled entities detached from an I/O baseline.
+/// Each payload may share the editable document's immutable entity image;
+/// the remaining CadDocument retains tables, objects, raw records and all
+/// unmodeled native fields. This is not a stand-alone drawing.
+#[derive(Debug, Clone)]
+pub struct DetachedEntitySlots<T> {
+    total: usize,
+    rows: Vec<(usize, Handle, T)>,
+}
+
+impl<T> DetachedEntitySlots<T> {
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Handle, &T)> {
+        self.rows.iter().map(|(_, handle, payload)| (*handle, payload))
+    }
+}
+
 /// A CAD document containing all drawing data
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1293,22 +1357,15 @@ pub struct CadDocument {
     /// Notifications collected during the last read/write operation
     pub notifications: crate::notification::NotificationCollection,
 
-    /// All entities in the document (contiguous storage for cache locality).
-    /// Each entity is behind an `Arc` so cloning the whole document — the undo
-    /// snapshot on every edit — is O(entities) atomic bumps that structurally
-    /// share the geometry, not an O(entities) deep copy. A single-entity edit
-    /// (`get_entity_mut`) copies just that one entity out of the shared Arc
-    /// (`Arc::make_mut`), so the snapshot and the live doc diverge only where
-    /// they actually differ.
-    pub(crate) entities: Vec<Arc<EntityType>>,
+    /// Native entities in the original flat-slot order. Persistent nodes
+    /// share the same Arc<EntityType> records across snapshots; an edit
+    /// detaches only the path and the affected record.
+    pub(crate) entities: EntitySlots,
 
-    /// Handle → index mapping for O(1) entity lookup by handle.
-    ///
-    /// The hasher must not depend on the process: plugins read a document the
-    /// host built through a shared reference across a dynamic-library
-    /// boundary, and foldhash's `RandomState` mixes in a per-process global
-    /// seed, so every lookup from the other binary missed.
-    pub(crate) entity_index: std::collections::HashMap<Handle, usize, foldhash::fast::FixedState>,
+    /// Handle -> flat slot. The HY3D persistent ordered index shares its root
+    /// across snapshots. This changes lookup from hashing to tree traversal;
+    /// real drawing performance must be measured before product adoption.
+    pub(crate) entity_index: CowMap<Handle, usize>,
 
     /// All objects in the document (indexed by handle)
     pub objects: HashMap<Handle, ObjectType>,
@@ -1596,7 +1653,7 @@ impl CadDocument {
             vx_control_entries: Vec::new(),
             classes: DxfClassCollection::new(),
             notifications: crate::notification::NotificationCollection::new(),
-            entities: Vec::new(),
+            entities: EntitySlots::new(),
             entity_index: Default::default(),
             objects: HashMap::new(),
             block_visibility_params: HashMap::new(),
@@ -2287,11 +2344,20 @@ impl CadDocument {
         if self.header.handle_seed > self.next_handle {
             self.next_handle = self.header.handle_seed;
         }
-        let handle = Handle::new(self.next_handle);
-        self.next_handle += 1;
+        let handle = issue_handle(&mut self.next_handle);
         // Keep HANDSEED in sync — DWG header requires this to be ≥ next_handle
         self.header.handle_seed = self.next_handle;
         handle
+    }
+
+    /// Copy the effective high-water mark without cloning any drawing data.
+    /// This is a detached reservation state, not a second native document.
+    /// The caller must reconcile reservations with the actual document before
+    /// inserting entities into it.
+    pub fn detached_handle_allocator(&self) -> CadHandleAllocator {
+        CadHandleAllocator {
+            next: self.next_handle.max(self.header.handle_seed),
+        }
     }
 
     /// Advance the allocator above every stored record identity.
@@ -3527,13 +3593,206 @@ impl CadDocument {
         }
 
         let base = self.entities.len();
-        self.entities.append(entities);
-        for (offset, entity) in self.entities[base..].iter().enumerate() {
-            self.entity_index
-                .insert(entity.common().handle, base + offset);
+        // Preserve the loader's Arc and slot order without a full-tree scan
+        // or a temporary contiguous geometry copy. The first large batch can
+        // build both trees bottom-up. Duplicate handles retain the last slot,
+        // exactly as repeated inserts in the old hash index did.
+        if base == 0 && self.entity_index.is_empty() {
+            let mut entries: Vec<_> = entities.iter().enumerate()
+                .map(|(index, entity)| (entity.common().handle, index))
+                .collect();
+            entries.sort_unstable_by_key(|&(handle, index)| (handle, index));
+            entries.dedup_by(|later, earlier| {
+                if later.0 == earlier.0 {
+                    earlier.1 = later.1;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.entity_index = CowMap::from_sorted_unique(entries);
+        } else {
+            for (offset, entity) in entities.iter().enumerate() {
+                self.entity_index.insert(entity.common().handle, base + offset);
+            }
         }
+        self.entities.append(entities);
         self.next_handle = next_handle;
         self.header.handle_seed = self.header.handle_seed.max(next_handle);
+    }
+
+    /// Detach selected, independently reconstructible entities from an I/O
+    /// baseline, without deleting their block membership, raw records or
+    /// referenced objects. The projector must keep every field not represented
+    /// by its shared editable image. A sparse baseline must not be used by
+    /// writers or general CAD operations before rejoining the slots.
+    pub fn detach_entity_slots<T>(
+        &mut self,
+        mut project: impl FnMut(&EntityType) -> Option<T>,
+    ) -> DetachedEntitySlots<T> {
+        let total = self.entities.len();
+        let mut detached = DetachedEntitySlots { total, rows: Vec::new() };
+        // Duplicate/null/misindexed handles cannot be safely split.
+        if !self.can_detach_io_slots() {
+            return detached;
+        }
+        let mut kept = Vec::new();
+        for (slot, entity) in self.entities.iter().enumerate() {
+            if let Some(payload) = project(entity.as_ref()) {
+                detached.rows.push((slot, entity.common().handle, payload));
+            } else {
+                kept.push(Arc::clone(entity));
+            }
+        }
+        if !detached.is_empty() {
+            self.replace_io_entity_slots(kept);
+        }
+        detached
+    }
+
+    /// Consume native slot Arcs during import. The projector either owns
+    /// the detached residue or returns the original, unchanged source Arc.
+    /// No normal edit API is involved, so raw DWG records, block membership
+    /// and allocator state are preserved. Invalid slot indexes invoke no
+    /// projector and leave the document untouched.
+    pub fn detach_entity_slots_owned<T>(
+        &mut self,
+        mut project: impl FnMut(Arc<EntityType>) -> std::result::Result<T, Arc<EntityType>>,
+    ) -> DetachedEntitySlots<T> {
+        let total = self.entities.len();
+        let mut detached = DetachedEntitySlots { total, rows: Vec::new() };
+        if !self.can_detach_io_slots() || total == 0 {
+            return detached;
+        }
+        let source = std::mem::take(&mut self.entities).into_arcs();
+        let mut kept = Vec::new();
+        for (slot, entity) in source.into_iter().enumerate() {
+            let handle = entity.common().handle;
+            match project(entity) {
+                Ok(payload) => detached.rows.push((slot, handle, payload)),
+                Err(entity) => {
+                    // This is the projector's contract, not a file-data
+                    // assumption: the original retained slot must survive.
+                    assert_eq!(entity.common().handle, handle, "retained source handle changed");
+                    kept.push(entity);
+                }
+            }
+        }
+        if detached.is_empty() {
+            // The original handle index remains valid.
+            self.entities.append(&mut kept);
+        } else {
+            self.replace_io_entity_slots(kept);
+        }
+        detached
+    }
+
+    fn can_detach_io_slots(&self) -> bool {
+        self.active_entity_change_recorder().is_none()
+            && self.entity_index.len() == self.entities.len()
+            && self.entities.iter().enumerate().all(|(slot, entity)| {
+                let handle = entity.common().handle;
+                !handle.is_null() && self.entity_index.get(&handle) == Some(&slot)
+            })
+    }
+
+    /// Rejoin detached entity images in their exact original flat order.
+    /// No add/remove APIs are used: raw record identity, block membership,
+    /// handle allocator and unrelated native objects remain untouched.
+    /// On any invalid reconstruction the sparse document is left unchanged.
+    pub fn rejoin_entity_slots<T>(
+        &mut self,
+        detached: &DetachedEntitySlots<T>,
+        rebuild: impl FnMut(&T) -> Option<EntityType>,
+    ) -> Result<()> {
+        self.rejoin_entity_slots_without(detached, &HashSet::new(), rebuild)
+    }
+
+    /// Restore a sparse export image without materializing explicitly deleted,
+    /// independently owned primitive slots. The caller proves their entity
+    /// kind and source identity from the residue; this method rejects any
+    /// omitted handle with native owned objects or ambiguous object identity.
+    /// Kept entities retain original relative order and block membership.
+    pub fn rejoin_entity_slots_without<T>(
+        &mut self,
+        detached: &DetachedEntitySlots<T>,
+        omit: &HashSet<Handle>,
+        mut rebuild: impl FnMut(&T) -> Option<EntityType>,
+    ) -> Result<()> {
+        if !omit.is_empty() && (omit.iter().any(|h| self.objects.contains_key(h)
+                || self.entity_index.contains_key(h))
+            || self.objects.keys().any(|&h| self.object_owner(h).is_some_and(|owner| omit.contains(&owner)))
+            || detached.iter().filter(|(h, _)| omit.contains(h)).count() != omit.len())
+        {
+            return Err(crate::error::DxfError::Custom("Cannot omit detached slots with native ownership".into()));
+        }
+        if detached.is_empty() {
+            return Ok(());
+        }
+        if self.active_entity_change_recorder().is_some()
+            || self.entities.len().checked_add(detached.len()) != Some(detached.total)
+        {
+            return Err(crate::error::DxfError::Custom("Detached entity slot count mismatch".into()));
+        }
+        let mut rows = detached.rows.iter().peekable();
+        let mut kept = self.entities.iter();
+        let capacity = detached.total.saturating_sub(omit.len());
+        let mut joined = Vec::with_capacity(capacity);
+        let mut index = Vec::with_capacity(capacity);
+        for slot in 0..detached.total {
+            let entity = if rows.peek().is_some_and(|row| row.0 == slot) {
+                let (_, handle, payload) = rows.next().expect("peeked detached row");
+                if omit.contains(handle) { continue; }
+                let Some(entity) = rebuild(payload) else {
+                    return Err(crate::error::DxfError::Custom("Cannot reconstruct detached entity".into()));
+                };
+                if entity.common().handle != *handle {
+                    return Err(crate::error::DxfError::Custom("Detached entity handle mismatch".into()));
+                }
+                Arc::new(entity)
+            } else {
+                let Some(entity) = kept.next() else {
+                    return Err(crate::error::DxfError::Custom("Missing retained entity slot".into()));
+                };
+                Arc::clone(entity)
+            };
+            let handle = entity.common().handle;
+            if handle.is_null() {
+                return Err(crate::error::DxfError::Custom("Null rejoined entity handle".into()));
+            }
+            index.push((handle, joined.len()));
+            joined.push(entity);
+        }
+        if rows.next().is_some() || kept.next().is_some() {
+            return Err(crate::error::DxfError::Custom("Unexpected remaining entity slots".into()));
+        }
+        // Validate uniqueness using the very same sorted index that is
+        // installed in the document; no second full-size hash set or index.
+        index.sort_unstable_by_key(|&(handle, _)| handle);
+        if index.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(crate::error::DxfError::Custom("Duplicate rejoined entity handle".into()));
+        }
+        self.install_io_entity_slots(joined, index);
+        if !omit.is_empty() {
+            for record in self.block_records.iter_mut() {
+                record.entity_handles.retain(|handle| !omit.contains(handle));
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_io_entity_slots(&mut self, entities: Vec<Arc<EntityType>>) {
+        let mut index: Vec<_> = entities.iter().enumerate()
+            .map(|(slot, entity)| (entity.common().handle, slot)).collect();
+        index.sort_unstable_by_key(|&(handle, _)| handle);
+        self.install_io_entity_slots(entities, index);
+    }
+
+    fn install_io_entity_slots(&mut self, mut entities: Vec<Arc<EntityType>>, index: Vec<(Handle, usize)>) {
+        self.entity_index = CowMap::from_sorted_unique(index);
+        let mut slots = EntitySlots::new();
+        slots.append(&mut entities);
+        self.entities = slots;
     }
 
     /// Get an entity by handle
@@ -3782,6 +4041,60 @@ impl CadDocument {
         Ok(handle)
     }
 
+    /// Reconcile the block-record ownership of already modeled primitives on
+    /// an independent export document. Handles, entity slots and unrelated
+    /// ownership objects remain intact. This is not a general transaction API:
+    /// block membership changes are not represented by EntityChangeRecorder.
+    ///
+    /// All targets and entity kinds are checked before any mutation. Unknown
+    /// source owners are not guessed. Only LINE, CIRCLE and ARC are supported;
+    /// INSERT, ATTRIB, viewports and compound/unknown records are excluded.
+    pub fn reconcile_primitive_owners_for_export(
+        &mut self,
+        moves: &[(Handle, Handle)],
+    ) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let block_handles: HashSet<Handle> = self.block_records.iter()
+            .map(|record| record.handle).collect();
+        let mut changed = HashSet::with_capacity(moves.len());
+        let mut by_owner: HashMap<Handle, Vec<Handle>> = HashMap::new();
+        for &(handle, owner) in moves {
+            let Some(entity) = self.get_entity(handle) else {
+                return Err(crate::error::DxfError::Custom(format!("Missing primitive {:?}", handle)));
+            };
+            let old_owner = entity.common().owner_handle;
+            if owner.is_null() || !block_handles.contains(&owner)
+                || (!old_owner.is_null() && !block_handles.contains(&old_owner))
+                || !matches!(entity, EntityType::Line(_) | EntityType::Circle(_) | EntityType::Arc(_))
+                || old_owner == owner || !changed.insert(handle)
+            {
+                return Err(crate::error::DxfError::Custom(format!("Invalid primitive ownership change {:?}", handle)));
+            }
+            by_owner.entry(owner).or_default().push(handle);
+        }
+        // Update each native slot once; get_entity_mut invalidates verbatim
+        // raw_record because its encoded owner no longer matches. Derive
+        // entity mode from the real owner (including non-active layouts).
+        for &(handle, owner) in moves {
+            if let Some(entity) = self.get_entity_mut(handle) {
+                let common = entity.common_mut();
+                common.owner_handle = owner;
+                common.entity_mode = None;
+            }
+        }
+        // Batch membership cleanup; no cascading entity deletion and no
+        // quadratic per-primitive scan of large membership lists.
+        for record in self.block_records.iter_mut() {
+            record.entity_handles.retain(|handle| !changed.contains(handle));
+            if let Some(handles) = by_owner.remove(&record.handle) {
+                record.entity_handles.extend(handles);
+            }
+        }
+        Ok(())
+    }
+
     /// Remove an entity by handle while retaining its shared allocation.
     ///
     /// The owner block record intentionally keeps the handle so an undo can
@@ -3798,6 +4111,45 @@ impl CadDocument {
             self.entity_index.insert(moved_handle, idx);
         }
         Some(entity)
+    }
+
+    /// Export-only batch removal of ordinary (non-ARCH) entities.
+    /// Return None without mutation if special cascade semantics or
+    /// ambiguous entity/object handles require the existing removal path.
+    /// Like remove_entity, leaves block membership to the caller.
+    pub fn remove_plain_entities_for_export(&mut self, handles: &[Handle]) -> Option<Vec<Handle>> {
+        if self.active_entity_change_recorder().is_some() || handles.len() < 2 {
+            return None;
+        }
+        let roots: HashSet<Handle> = handles.iter().copied().filter(|h| self.get_entity(*h).is_some()).collect();
+        if roots.len() < 2 || roots.iter().any(|h| self.objects.contains_key(h)
+            || crate::classes::arch::is_architecture_entity(self, *h))
+        {
+            return None;
+        }
+        // Match arch::objects_owned_by's exact 24-hop owner semantics,
+        // but test membership of every ordinary root in one object pass.
+        let doomed: Vec<Handle> = self.objects.keys().copied().filter(|handle| {
+            let mut current = *handle;
+            for _ in 0..24 {
+                let Some(owner) = self.object_owner(current) else { return false };
+                if roots.contains(&owner) { return true; }
+                if owner.is_null() || owner == current { return false; }
+                current = owner;
+            }
+            false
+        }).collect();
+        for handle in doomed {
+            self.objects.remove(&handle);
+            self.reactors_by_handle.remove(&handle);
+        }
+        // Keep the existing swap-remove order and avoid cloning removed
+        // entity payloads just to discard them.
+        let mut removed = Vec::with_capacity(roots.len());
+        for &handle in handles {
+            if self.remove_entity_arc(handle).is_some() { removed.push(handle); }
+        }
+        Some(removed)
     }
 
     /// Remove an entity by handle.

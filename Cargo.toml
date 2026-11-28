@@ -16,6 +16,8 @@ categories = ["parser-implementations", "encoding"]
 default = ["parallel"]
 parallel = ["dep:rayon"]
 serde = ["dep:serde", "bitflags/serde", "indexmap/serde"]
+# HY3D needs only the container serialization, not whole native document serde.
+hy3d-persist-serde = ["dep:serde"]
 import = ["dep:quick-xml", "dep:serde_json"]
 
 [dependencies]
