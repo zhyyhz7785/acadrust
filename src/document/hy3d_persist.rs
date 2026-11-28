@@ -1306,17 +1306,34 @@ impl<K: Ord + Clone, V> CowMap<K, V> {
     pub(crate) fn from_sorted_unique(entries: Vec<(K, V)>) -> Self {
         debug_assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let len = entries.len();
+        Self::build_sorted_records(len, entries.into_iter().map(|(key, value)| (key, Arc::new(value))))
+    }
+
+    /// Build a balanced tree from unique, already allocated records. Only
+    /// small (key, Arc) pairs are sorted; no entity payload is copied or
+    /// moved during sorting. Duplicate keys are returned intact to the caller.
+    pub fn from_unique_records(mut entries: Vec<(K, Arc<V>)>) -> Result<Self, Vec<(K, Arc<V>)>> {
+        if !entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(entries);
+            }
+        }
+        let len = entries.len();
+        Ok(Self::build_sorted_records(len, entries.into_iter()))
+    }
+
+    fn build_sorted_records(len: usize, mut entries: impl Iterator<Item = (K, Arc<V>)>) -> Self {
         if len == 0 { return Self::new(); }
-        let mut entries = entries.into_iter();
         let groups = len.div_ceil(FANOUT);
         let mut level = Vec::with_capacity(groups);
         for i in 0..groups {
             let count = len / groups + usize::from(i < len % groups);
             let mut keys = Vec::with_capacity(count);
             let mut records = Vec::with_capacity(count);
-            for (key, value) in entries.by_ref().take(count) {
+            for (key, record) in entries.by_ref().take(count) {
                 keys.push(key);
-                records.push(Arc::new(value));
+                records.push(record);
             }
             level.push(Arc::new(Node::Leaf(Leaf { keys, records })));
         }
