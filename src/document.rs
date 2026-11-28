@@ -3842,6 +3842,60 @@ impl CadDocument {
         Ok(handle)
     }
 
+    /// Reconcile the block-record ownership of already modeled primitives on
+    /// an independent export document. Handles, entity slots and unrelated
+    /// ownership objects remain intact. This is not a general transaction API:
+    /// block membership changes are not represented by EntityChangeRecorder.
+    ///
+    /// All targets and entity kinds are checked before any mutation. Unknown
+    /// source owners are not guessed. Only LINE, CIRCLE and ARC are supported;
+    /// INSERT, ATTRIB, viewports and compound/unknown records are excluded.
+    pub fn reconcile_primitive_owners_for_export(
+        &mut self,
+        moves: &[(Handle, Handle)],
+    ) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let block_handles: HashSet<Handle> = self.block_records.iter()
+            .map(|record| record.handle).collect();
+        let mut changed = HashSet::with_capacity(moves.len());
+        let mut by_owner: HashMap<Handle, Vec<Handle>> = HashMap::new();
+        for &(handle, owner) in moves {
+            let Some(entity) = self.get_entity(handle) else {
+                return Err(crate::error::DxfError::Custom(format!("Missing primitive {:?}", handle)));
+            };
+            let old_owner = entity.common().owner_handle;
+            if owner.is_null() || !block_handles.contains(&owner)
+                || (!old_owner.is_null() && !block_handles.contains(&old_owner))
+                || !matches!(entity, EntityType::Line(_) | EntityType::Circle(_) | EntityType::Arc(_))
+                || old_owner == owner || !changed.insert(handle)
+            {
+                return Err(crate::error::DxfError::Custom(format!("Invalid primitive ownership change {:?}", handle)));
+            }
+            by_owner.entry(owner).or_default().push(handle);
+        }
+        // Update each native slot once; get_entity_mut invalidates verbatim
+        // raw_record because its encoded owner no longer matches. Derive
+        // entity mode from the real owner (including non-active layouts).
+        for &(handle, owner) in moves {
+            if let Some(entity) = self.get_entity_mut(handle) {
+                let common = entity.common_mut();
+                common.owner_handle = owner;
+                common.entity_mode = None;
+            }
+        }
+        // Batch membership cleanup; no cascading entity deletion and no
+        // quadratic per-primitive scan of large membership lists.
+        for record in self.block_records.iter_mut() {
+            record.entity_handles.retain(|handle| !changed.contains(handle));
+            if let Some(handles) = by_owner.remove(&record.handle) {
+                record.entity_handles.extend(handles);
+            }
+        }
+        Ok(())
+    }
+
     /// Remove an entity by handle while retaining its shared allocation.
     ///
     /// The owner block record intentionally keeps the handle so an undo can
