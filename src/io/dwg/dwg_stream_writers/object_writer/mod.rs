@@ -792,8 +792,8 @@ impl<'a> DwgObjectWriter<'a> {
     // ── Table entry writers ─────────────────────────────────────────
 
     fn write_vx_entries(&mut self) {
-        let entries: Vec<_> = self.document.vx_table.iter().cloned().collect();
-        for entry in &entries {
+        let document = self.document;
+        for entry in document.vx_table.iter() {
             self.write_vx_entry(entry);
         }
     }
@@ -823,8 +823,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_layer_entries(&mut self) {
-        let entries: Vec<_> = self.document.layers.iter().map(|l| l.clone()).collect();
-        for layer in &entries {
+        let document = self.document;
+        for layer in document.layers.iter() {
             self.write_layer(layer);
         }
     }
@@ -984,13 +984,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_text_style_entries(&mut self) {
-        let entries: Vec<_> = self
-            .document
-            .text_styles
-            .iter()
-            .map(|s| s.clone())
-            .collect();
-        for style in &entries {
+        let document = self.document;
+        for style in document.text_styles.iter() {
             self.write_text_style(style);
         }
     }
@@ -1060,13 +1055,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_ltype_entries(&mut self) {
-        let entries: Vec<_> = self
-            .document
-            .line_types
-            .iter()
-            .map(|lt| lt.clone())
-            .collect();
-        for lt in &entries {
+        let document = self.document;
+        for lt in document.line_types.iter() {
             self.write_line_type(lt);
         }
     }
@@ -1198,8 +1188,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_view_entries(&mut self) {
-        let entries: Vec<_> = self.document.views.iter().map(|v| v.clone()).collect();
-        for view in &entries {
+        let document = self.document;
+        for view in document.views.iter() {
             self.write_view(view);
         }
     }
@@ -1298,8 +1288,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_ucs_entries(&mut self) {
-        let entries: Vec<_> = self.document.ucss.iter().map(|u| u.clone()).collect();
-        for ucs in &entries {
+        let document = self.document;
+        for ucs in document.ucss.iter() {
             self.write_ucs(ucs);
         }
     }
@@ -1340,8 +1330,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_vport_entries(&mut self) {
-        let entries: Vec<_> = self.document.vports.iter().cloned().collect();
-        for vp in &entries {
+        let document = self.document;
+        for vp in document.vports.iter() {
             self.write_vport(vp);
         }
     }
@@ -1514,9 +1504,10 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_appid_entries(&mut self) {
-        let mut entries: Vec<_> = self.document.app_ids.iter().map(|a| a.clone()).collect();
+        let document = self.document;
+        let mut entries: Vec<_> = document.app_ids.iter().collect();
         entries.sort_by_key(|app| !app.name.eq_ignore_ascii_case("ACAD"));
-        for app in &entries {
+        for app in entries {
             self.write_appid(app);
         }
     }
@@ -1566,8 +1557,8 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_dimstyle_entries(&mut self) {
-        let entries: Vec<_> = self.document.dim_styles.iter().map(|d| d.clone()).collect();
-        for ds in &entries {
+        let document = self.document;
+        for ds in document.dim_styles.iter() {
             self.write_dimstyle(ds);
         }
     }
@@ -1939,14 +1930,10 @@ impl<'a> DwgObjectWriter<'a> {
     fn write_block_entities(&mut self) {
         use crate::io::dwg::parallel::{map_chunks, worker_count};
 
-        let block_records: Vec<BlockRecord> = self
-            .document
-            .block_records
-            .iter()
-            .map(|br| br.clone())
-            .collect();
-
-        for br in &block_records {
+        // The encoder mutates only its stream state, never the source.
+        // Copy the shared reference, not every block's membership vector.
+        let document = self.document;
+        for br in document.block_records.iter() {
             // An xref block record references an external drawing: its contents
             // live in that file, not here. Some hosts merge the resolved xref
             // geometry into the block record for display; serializing those as
@@ -2578,15 +2565,17 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Drain the object queue, writing each non-graphical object.
     fn write_objects(&mut self) {
+        // Borrow the immutable database independently of mutable stream
+        // state. Large unknown objects and XRECORDs need no temporary clone.
+        let document = self.document;
         // Phase 1: drain the queue (root dict entries + xdict handles)
         while let Some(handle) = self.object_queue.pop_front() {
             if self.visited_objects.contains(&handle) {
                 continue;
             }
-            if let Some(obj) = self.document.objects.get(&handle) {
+            if let Some(obj) = document.objects.get(&handle) {
                 self.visited_objects.insert(handle);
-                let obj = obj.clone();
-                self.write_object(&obj);
+                self.write_object(obj);
             }
         }
 
@@ -2604,29 +2593,25 @@ impl<'a> DwgObjectWriter<'a> {
             self.visited_objects.insert(Handle::from(handle_val));
         }
 
-        let mut remaining: Vec<(Handle, crate::objects::ObjectType)> = self
-            .document
-            .objects
-            .iter()
-            .filter(|(h, _)| !self.visited_objects.contains(h))
-            .map(|(h, o)| (*h, o.clone()))
+        let mut remaining: Vec<Handle> = document.objects.keys().copied()
+            .filter(|h| !self.visited_objects.contains(h))
             .collect();
         // `objects` is a HashMap: iterate in handle order so the same
         // document writes the same bytes on every call.
-        remaining.sort_by_key(|(h, _)| h.value());
+        remaining.sort_unstable_by_key(|h| h.value());
 
-        for (handle, obj) in remaining {
+        for handle in remaining {
+            let Some(obj) = document.objects.get(&handle) else { continue };
             self.visited_objects.insert(handle);
-            self.write_object(&obj);
+            self.write_object(obj);
             // Drain any newly enqueued objects (children of orphan dicts)
             while let Some(child) = self.object_queue.pop_front() {
                 if self.visited_objects.contains(&child) {
                     continue;
                 }
-                if let Some(child_obj) = self.document.objects.get(&child) {
+                if let Some(child_obj) = document.objects.get(&child) {
                     self.visited_objects.insert(child);
-                    let child_obj = child_obj.clone();
-                    self.write_object(&child_obj);
+                    self.write_object(child_obj);
                 }
             }
         }
