@@ -121,17 +121,23 @@ impl<T: TableEntry> Table<T> {
     pub fn detach_rows<R>(&mut self, mut capture: impl FnMut(&T) -> Option<R>) -> DetachedTableRows<R> {
         let original_len = self.entries.len();
         let mut rows = Vec::new();
-        let mut remaining = IndexMap::new();
-        for (index, (key, entry)) in std::mem::take(&mut self.entries).into_iter().enumerate() {
-            if key_matches(&key, entry.name()) {
-                if let Some(residue) = capture(&entry) {
-                    rows.push((index, key, residue));
-                    continue;
+        let mut index = 0;
+        self.entries.retain(|key, entry| {
+            let slot = index;
+            index += 1;
+            if key_matches(key, entry.name()) {
+                if let Some(residue) = capture(entry) {
+                    rows.push((slot, key.clone(), residue));
+                    return false;
                 }
             }
-            remaining.insert(key, entry);
+            true
+        });
+        // No accepted row: keep the original allocation and hash table.
+        // Large reductions should release the original spare capacity.
+        if !rows.is_empty() && self.entries.capacity() > self.entries.len().saturating_mul(2) {
+            self.entries.shrink_to_fit();
         }
-        self.entries = remaining;
         DetachedTableRows { original_len, rows }
     }
 

@@ -3666,7 +3666,7 @@ impl CadDocument {
         let mut rows = detached.rows.iter().peekable();
         let mut kept = self.entities.iter();
         let mut joined = Vec::with_capacity(detached.total);
-        let mut handles = HashSet::with_capacity(detached.total);
+        let mut index = Vec::with_capacity(detached.total);
         for slot in 0..detached.total {
             let entity = if rows.peek().is_some_and(|row| row.0 == slot) {
                 let (_, handle, payload) = rows.next().expect("peeked detached row");
@@ -3684,22 +3684,33 @@ impl CadDocument {
                 Arc::clone(entity)
             };
             let handle = entity.common().handle;
-            if handle.is_null() || !handles.insert(handle) {
-                return Err(crate::error::DxfError::Custom("Duplicate or null rejoined entity handle".into()));
+            if handle.is_null() {
+                return Err(crate::error::DxfError::Custom("Null rejoined entity handle".into()));
             }
+            index.push((handle, slot));
             joined.push(entity);
         }
         if rows.next().is_some() || kept.next().is_some() {
             return Err(crate::error::DxfError::Custom("Unexpected remaining entity slots".into()));
         }
-        self.replace_io_entity_slots(joined);
+        // Validate uniqueness using the very same sorted index that is
+        // installed in the document; no second full-size hash set or index.
+        index.sort_unstable_by_key(|&(handle, _)| handle);
+        if index.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(crate::error::DxfError::Custom("Duplicate rejoined entity handle".into()));
+        }
+        self.install_io_entity_slots(joined, index);
         Ok(())
     }
 
-    fn replace_io_entity_slots(&mut self, mut entities: Vec<Arc<EntityType>>) {
+    fn replace_io_entity_slots(&mut self, entities: Vec<Arc<EntityType>>) {
         let mut index: Vec<_> = entities.iter().enumerate()
             .map(|(slot, entity)| (entity.common().handle, slot)).collect();
         index.sort_unstable_by_key(|&(handle, _)| handle);
+        self.install_io_entity_slots(entities, index);
+    }
+
+    fn install_io_entity_slots(&mut self, mut entities: Vec<Arc<EntityType>>, index: Vec<(Handle, usize)>) {
         self.entity_index = CowMap::from_sorted_unique(index);
         let mut slots = EntitySlots::new();
         slots.append(&mut entities);
@@ -4022,6 +4033,45 @@ impl CadDocument {
             self.entity_index.insert(moved_handle, idx);
         }
         Some(entity)
+    }
+
+    /// Export-only batch removal of ordinary (non-ARCH) entities.
+    /// Return None without mutation if special cascade semantics or
+    /// ambiguous entity/object handles require the existing removal path.
+    /// Like remove_entity, leaves block membership to the caller.
+    pub fn remove_plain_entities_for_export(&mut self, handles: &[Handle]) -> Option<Vec<Handle>> {
+        if self.active_entity_change_recorder().is_some() || handles.len() < 2 {
+            return None;
+        }
+        let roots: HashSet<Handle> = handles.iter().copied().filter(|h| self.get_entity(*h).is_some()).collect();
+        if roots.len() < 2 || roots.iter().any(|h| self.objects.contains_key(h)
+            || crate::classes::arch::is_architecture_entity(self, *h))
+        {
+            return None;
+        }
+        // Match arch::objects_owned_by's exact 24-hop owner semantics,
+        // but test membership of every ordinary root in one object pass.
+        let doomed: Vec<Handle> = self.objects.keys().copied().filter(|handle| {
+            let mut current = *handle;
+            for _ in 0..24 {
+                let Some(owner) = self.object_owner(current) else { return false };
+                if roots.contains(&owner) { return true; }
+                if owner.is_null() || owner == current { return false; }
+                current = owner;
+            }
+            false
+        }).collect();
+        for handle in doomed {
+            self.objects.remove(&handle);
+            self.reactors_by_handle.remove(&handle);
+        }
+        // Keep the existing swap-remove order and avoid cloning removed
+        // entity payloads just to discard them.
+        let mut removed = Vec::with_capacity(roots.len());
+        for &handle in handles {
+            if self.remove_entity_arc(handle).is_some() { removed.push(handle); }
+        }
+        Some(removed)
     }
 
     /// Remove an entity by handle.

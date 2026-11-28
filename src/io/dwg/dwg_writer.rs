@@ -88,12 +88,13 @@ impl DwgWriter {
         // drawing. Assign fresh handles on a cloned document up front so
         // the controls, entries and handle map all agree (issue #51/#64
         // class of bug).
-        let mut owned;
-        let document: &CadDocument = if document.has_null_table_entries()
+        if document.has_null_table_entries()
             || document.version < DxfVersion::AC1027
             || has_missing_object_classes(document)
         {
-            owned = document.clone();
+            // Preparation may already own a document. Reuse that copy
+            // instead of deep-cloning its object tables a second time.
+            let owned = prepared.to_mut();
             if owned.has_null_table_entries() {
                 owned.assign_table_entry_handles();
             }
@@ -102,23 +103,21 @@ impl DwgWriter {
                 // for it, and the verbatim records copied from that file
                 // carry its class numbers: leave it as it is.
                 if owned.dwg_source_version != Some(owned.version) {
-                    prepare_legacy_classes(&mut owned);
+                    prepare_legacy_classes(owned);
                 }
             }
             // Objects added after reading (an evaluated dynamic block's
             // AcDbBlockRepresentationData, a drawing variable) need their
             // class whatever the version; the verbatim table only gains
             // entries at its end, so the numbers it carries stay valid.
-            add_missing_object_classes(&mut owned);
+            add_missing_object_classes(owned);
             if owned.version < DxfVersion::AC1027 {
-                prepare_legacy_document(&mut owned);
-                crate::objects::store_table_style_roundtrip(&mut owned);
-                crate::objects::store_visual_style_roundtrip(&mut owned);
+                prepare_legacy_document(owned);
+                crate::objects::store_table_style_roundtrip(owned);
+                crate::objects::store_visual_style_roundtrip(owned);
             }
-            &owned
-        } else {
-            document
-        };
+        }
+        let document = prepared.as_ref();
 
         let result = if uses_ac21_format(version) {
             write_ac21(&mut output, document, version)
