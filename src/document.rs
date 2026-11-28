@@ -1288,6 +1288,10 @@ pub struct DetachedEntitySlots<T> {
 impl<T> DetachedEntitySlots<T> {
     pub fn len(&self) -> usize { self.rows.len() }
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Handle, &T)> {
+        self.rows.iter().map(|(_, handle, payload)| (*handle, payload))
+    }
 }
 
 /// A CAD document containing all drawing data
@@ -3653,8 +3657,29 @@ impl CadDocument {
     pub fn rejoin_entity_slots<T>(
         &mut self,
         detached: &DetachedEntitySlots<T>,
+        rebuild: impl FnMut(&T) -> Option<EntityType>,
+    ) -> Result<()> {
+        self.rejoin_entity_slots_without(detached, &HashSet::new(), rebuild)
+    }
+
+    /// Restore a sparse export image without materializing explicitly deleted,
+    /// independently owned primitive slots. The caller proves their entity
+    /// kind and source identity from the residue; this method rejects any
+    /// omitted handle with native owned objects or ambiguous object identity.
+    /// Kept entities retain original relative order and block membership.
+    pub fn rejoin_entity_slots_without<T>(
+        &mut self,
+        detached: &DetachedEntitySlots<T>,
+        omit: &HashSet<Handle>,
         mut rebuild: impl FnMut(&T) -> Option<EntityType>,
     ) -> Result<()> {
+        if !omit.is_empty() && (omit.iter().any(|h| self.objects.contains_key(h)
+                || self.entity_index.contains_key(h))
+            || self.objects.keys().any(|&h| self.object_owner(h).is_some_and(|owner| omit.contains(&owner)))
+            || detached.iter().filter(|(h, _)| omit.contains(h)).count() != omit.len())
+        {
+            return Err(crate::error::DxfError::Custom("Cannot omit detached slots with native ownership".into()));
+        }
         if detached.is_empty() {
             return Ok(());
         }
@@ -3665,11 +3690,13 @@ impl CadDocument {
         }
         let mut rows = detached.rows.iter().peekable();
         let mut kept = self.entities.iter();
-        let mut joined = Vec::with_capacity(detached.total);
-        let mut index = Vec::with_capacity(detached.total);
+        let capacity = detached.total.saturating_sub(omit.len());
+        let mut joined = Vec::with_capacity(capacity);
+        let mut index = Vec::with_capacity(capacity);
         for slot in 0..detached.total {
             let entity = if rows.peek().is_some_and(|row| row.0 == slot) {
                 let (_, handle, payload) = rows.next().expect("peeked detached row");
+                if omit.contains(handle) { continue; }
                 let Some(entity) = rebuild(payload) else {
                     return Err(crate::error::DxfError::Custom("Cannot reconstruct detached entity".into()));
                 };
@@ -3687,7 +3714,7 @@ impl CadDocument {
             if handle.is_null() {
                 return Err(crate::error::DxfError::Custom("Null rejoined entity handle".into()));
             }
-            index.push((handle, slot));
+            index.push((handle, joined.len()));
             joined.push(entity);
         }
         if rows.next().is_some() || kept.next().is_some() {
@@ -3700,6 +3727,11 @@ impl CadDocument {
             return Err(crate::error::DxfError::Custom("Duplicate rejoined entity handle".into()));
         }
         self.install_io_entity_slots(joined, index);
+        if !omit.is_empty() {
+            for record in self.block_records.iter_mut() {
+                record.entity_handles.retain(|handle| !omit.contains(handle));
+            }
+        }
         Ok(())
     }
 
