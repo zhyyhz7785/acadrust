@@ -2153,6 +2153,13 @@ impl<T> CowSeq<T> {
         Self { root: level.pop(), len }
     }
 
+    /// Borrow the immutable record allocations directly. Block and paper
+    /// space readers can share the same entity images as the live sequence
+    /// without copying geometry or creating a second persistent tree.
+    pub fn iter_arcs(&self) -> impl Iterator<Item = &Arc<T>> + '_ {
+        self.shared_iter()
+    }
+
     pub(crate) fn shared_iter(&self) -> SeqSharedIter<'_, T> {
         let mut stack = Vec::new();
         if let Some(root) = self.root.as_deref() {
