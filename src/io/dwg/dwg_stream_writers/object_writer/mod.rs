@@ -1951,8 +1951,8 @@ impl<'a> DwgObjectWriter<'a> {
                 .copied()
                 .filter(|h| self.document.entity_index.contains_key(h))
                 .collect();
-            let entity_handles_for_header = if is_xref {
-                Vec::new()
+            let entity_handles_for_header: std::borrow::Cow<'_, [Handle]> = if is_xref {
+                std::borrow::Cow::Borrowed(&[])
             } else {
                 // Preserve the original order when it still matches the live set.
                 match self.document.block_entity_handles.get(&br.handle) {
@@ -1965,15 +1965,18 @@ impl<'a> DwgObjectWriter<'a> {
                             .filter(|h| valid.contains(&h.value()))
                             .collect();
                         if filtered.len() == live_handles.len() {
-                            filtered
+                            std::borrow::Cow::Owned(filtered)
                         } else {
-                            live_handles.clone()
+                            std::borrow::Cow::Borrowed(&live_handles)
                         }
                     }
-                    None => live_handles.clone(),
+                    None => std::borrow::Cow::Borrowed(&live_handles),
                 }
             };
             self.write_block_header_with_handles(br, &entity_handles_for_header);
+            // The alternate header order is no longer needed for entity
+            // serialization; release it before parallel output allocations.
+            drop(entity_handles_for_header);
             self.write_block_begin(br);
 
             if !is_xref {
@@ -2020,12 +2023,18 @@ impl<'a> DwgObjectWriter<'a> {
                             let worker_count = worker_count();
                             let chunk_size =
                                 ((run.len() + worker_count * 4 - 1) / (worker_count * 4)).max(512);
-                            let batches: Vec<ParallelEntityBatch> =
-                                map_chunks(run, chunk_size, |chunk| {
-                                    self.serialize_parallel_entity_batch(chunk)
-                                });
-                            for batch in batches {
-                                self.append_parallel_entity_batch(batch);
+                            // Retain at most one worker wave of encoded
+                            // batches. Keep the same chunk boundaries, order
+                            // and allocation floor as the original full run.
+                            let wave_size = chunk_size.saturating_mul(worker_count).max(chunk_size);
+                            for wave in run.chunks(wave_size) {
+                                let batches: Vec<ParallelEntityBatch> =
+                                    map_chunks(wave, chunk_size, |chunk| {
+                                        self.serialize_parallel_entity_batch(chunk)
+                                    });
+                                for batch in batches {
+                                    self.append_parallel_entity_batch(batch);
+                                }
                             }
                             continue;
                         }
