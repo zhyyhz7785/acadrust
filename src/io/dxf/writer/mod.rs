@@ -178,7 +178,28 @@ impl<'a> DxfWriter<'a> {
         if self.version == Some(crate::types::DxfVersion::AC1009) {
             return self.write_r12(writer);
         }
-        for (handle, object) in &self.document.objects {
+        let mut prepared = std::borrow::Cow::Borrowed(self.document);
+        Self::write_non_r12(writer, &mut prepared, self.binary, self.output_version())
+    }
+
+    /// The product export path already owns its document. Reuse it for
+    /// DXF reference repairs, and return the prepared source to its caller.
+    pub fn write_to_vec_owned(document: CadDocument) -> (Result<Vec<u8>>, CadDocument) {
+        let version = document.version;
+        let mut prepared = std::borrow::Cow::Owned(document);
+        let mut bytes = Vec::new();
+        let result = Self::write_non_r12(&mut bytes, &mut prepared, false, version)
+            .map(|()| bytes);
+        (result, prepared.into_owned())
+    }
+
+    fn write_non_r12<W: Write>(
+        writer: W,
+        prepared: &mut std::borrow::Cow<'_, CadDocument>,
+        binary: bool,
+        output_version: crate::types::DxfVersion,
+    ) -> Result<()> {
+        for (handle, object) in &prepared.objects {
             if let crate::objects::ObjectType::Unknown {
                 type_name,
                 raw_dxf_codes: None,
@@ -198,25 +219,25 @@ impl<'a> DxfWriter<'a> {
         // accepted as R2010 binary DXF, whose strings are UTF-8.  Keep this
         // compatibility promotion local to binary output; ASCII and DWG
         // continue to preserve the requested legacy version and code page.
-        let output_version = self.output_version();
         let encoding = if output_version < crate::types::DxfVersion::AC1021 {
-            crate::io::dxf::code_page::encoding_from_code_page(&self.document.header.code_page)
+            crate::io::dxf::code_page::encoding_from_code_page(&prepared.header.code_page)
         } else {
             None
         };
-        if self.binary {
+        Self::prepare_dxf(prepared);
+        if binary {
             let mut stream_writer = DxfBinaryWriter::new(writer)?;
             if let Some(encoding) = encoding {
                 stream_writer.set_encoding(encoding);
             }
-            self.write_dxf(&mut stream_writer, output_version)?;
+            Self::write_prepared_dxf(&mut stream_writer, prepared.as_ref(), output_version)?;
             stream_writer.flush()?;
         } else {
             let mut stream_writer = DxfTextWriter::new(writer);
             if let Some(encoding) = encoding {
                 stream_writer.set_encoding(encoding);
             }
-            self.write_dxf(&mut stream_writer, output_version)?;
+            Self::write_prepared_dxf(&mut stream_writer, prepared.as_ref(), output_version)?;
             stream_writer.flush()?;
         }
         Ok(())
@@ -258,21 +279,17 @@ impl<'a> DxfWriter<'a> {
         Ok(buffer)
     }
 
-    /// Write DXF content to a stream writer
-    fn write_dxf<W: DxfStreamWriter>(
-        &self,
-        writer: &mut W,
-        output_version: crate::types::DxfVersion,
-    ) -> Result<()> {
-        let mut prepared = crate::io::loft_parameters::prepared(self.document);
+    /// Shared preparation for borrowed and owned ASCII/binary output.
+    fn prepare_dxf(prepared: &mut std::borrow::Cow<'_, CadDocument>) {
+        crate::io::loft_parameters::prepare(prepared);
         // DXF and DWG share the same ownership graph. Repair table-backed
         // entities before either writer snapshots handles, otherwise an
         // ACAD_TABLE can emit a null/nonexistent block-record pointer.
-        crate::io::dwg::dwg_writer::prepare_database_references(&mut prepared);
+        crate::io::dwg::dwg_writer::prepare_database_references(prepared);
         // An in-place table rename leaves the entry keyed under its old name,
         // so entity layer/linetype lookups miss and reference a name the
         // written table no longer defines (issue #80).
-        crate::io::dwg::dwg_writer::prepare_table_keys(&mut prepared);
+        crate::io::dwg::dwg_writer::prepare_table_keys(prepared);
         // Table entries added after the document was built or read
         // (`Layer::new` + `layers.add`, `AppId::new` + `app_ids.add`) still
         // carry NULL handles. Written as they are, each becomes a `5 / 0`
@@ -282,12 +299,10 @@ impl<'a> DxfWriter<'a> {
         if prepared.has_null_table_entries() {
             prepared.to_mut().assign_table_entry_handles();
         }
-        crate::io::dwg::dwg_writer::prepare_active_viewport_elevation(&mut prepared);
-        self.write_prepared_dxf(writer, prepared.as_ref(), output_version)
+        crate::io::dwg::dwg_writer::prepare_active_viewport_elevation(prepared);
     }
 
     fn write_prepared_dxf<W: DxfStreamWriter>(
-        &self,
         writer: &mut W,
         document: &CadDocument,
         output_version: crate::types::DxfVersion,
