@@ -116,6 +116,8 @@ mod legacy_header;
 mod semantic_inventory;
 /// Shared persistent containers used by the enhanced native document and HY3D.
 pub mod hy3d_persist;
+/// Shared HY3D planar geometry payloads and native record operations.
+pub mod hy3d_geometry;
 mod entity_slots;
 use entity_slots::EntitySlots;
 use hy3d_persist::CowMap;
