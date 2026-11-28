@@ -41,6 +41,12 @@ pub struct CadHandleAllocator {
 }
 
 impl CadHandleAllocator {
+    /// Start a detached logical handle sequence with no native table reservations.
+    /// The owning application must reconcile it with the native document on export.
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
     /// Effective next handle, including HANDSEED reservations.
     pub fn next_handle(&self) -> u64 {
         self.next
