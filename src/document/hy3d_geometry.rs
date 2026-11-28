@@ -1,4 +1,6 @@
 //! HY3D planar editing shapes and their native entity boundary.
+//! Shape declarations adapted from HY3D `core/src/model.rs` (MIT OR Apache-2.0);
+//! source attribution and license notice in `HY3D-NOTICE.md`.
 //!
 //! The planar data types are the actual payloads used by HY3D's Geometry
 //! variants, not a separately stored cache. They deliberately do not model
@@ -50,13 +52,6 @@ pub fn editable_scalar(value: f64) -> f64 {
 }
 
 impl<P> PlanarLine<P> {
-    pub fn from_native(native: &Line, point: impl Fn(f64, f64) -> P) -> Self {
-        Self {
-            a: point(native.start.x, native.start.y),
-            b: point(native.end.x, native.end.y),
-        }
-    }
-
     pub fn matches_native(&self, native: &Line, thickness: f64, xy: impl Fn(&P) -> (f64, f64)) -> bool {
         same_xy(native.start, &self.a, &xy)
             && same_xy(native.end, &self.b, &xy)
@@ -79,13 +74,6 @@ impl<P> PlanarLine<P> {
 }
 
 impl<P> PlanarCircle<P> {
-    pub fn from_native(native: &Circle, point: impl Fn(f64, f64) -> P) -> Self {
-        Self {
-            center: point(native.center.x, native.center.y),
-            radius: native.radius,
-        }
-    }
-
     pub fn matches_native(&self, native: &Circle, thickness: f64, xy: impl Fn(&P) -> (f64, f64)) -> bool {
         same_xy(native.center, &self.center, xy)
             && native.radius == self.radius
@@ -106,15 +94,6 @@ impl<P> PlanarCircle<P> {
 }
 
 impl<P> PlanarArc<P> {
-    pub fn from_native(native: &Arc, point: impl Fn(f64, f64) -> P) -> Self {
-        Self {
-            center: point(native.center.x, native.center.y),
-            radius: native.radius,
-            start: native.start_angle,
-            end: native.end_angle,
-        }
-    }
-
     pub fn matches_native(&self, native: &Arc, thickness: f64, xy: impl Fn(&P) -> (f64, f64)) -> bool {
         same_xy(native.center, &self.center, xy)
             && native.radius == self.radius

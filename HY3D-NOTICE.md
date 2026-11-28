@@ -30,6 +30,10 @@ SOFTWARE.
 
 The surrounding modified acadrust files remain covered by MPL-2.0. Distributions must preserve the applicable license/notice and provide the required MPL-covered source. HY3D integration should reference this shared implementation rather than retain a divergent copy.
 
+## Shared planar geometry
+
+`src/document/hy3d_geometry.rs` adapts the planar LINE/ARC/CIRCLE declarations from HY3D `core/src/model.rs`, commit 310320e665c89e24b8271b8764758d785247cfa8 (https://github.com/zhyyhz7785/hy3d/blob/310320e665c89e24b8271b8764758d785247cfa8/core/src/model.rs). The imported declarations remain attributed to HY3D contributors under MIT OR Apache-2.0; the MIT permission notice above applies. The surrounding native record operations are part of the enhanced fork. HY3D Geometry uses these payloads directly with its existing Point2 math type; native compare/build/patch share the same methods. This does not yet remove the separate original native record held in the I/O baseline. No change to native EntityType layout, file codec, OCS/WCS convention or persisted format.
+
 ## Native storage changes
 
 - CadDocument owns one native ordered entity store, EntitySlots(CowSeq<EntityType>), and a derived CowMap<Handle, usize> index. Leaves contain the original Arc<EntityType>, not Arc<Arc<EntityType>> and not a converted HY3D geometry. Original slot order, swap_remove, handle lookup, shared before/after image API and native membership logic are preserved. No original/private side-channel fields moved or discarded.
