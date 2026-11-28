@@ -1919,7 +1919,7 @@ impl<T> CowSeq<T> {
         }
     }
 
-    fn into_arcs(self) -> Vec<Arc<T>> {
+    pub(crate) fn into_arcs(self) -> Vec<Arc<T>> {
         let mut out = Vec::with_capacity(self.len);
         if let Some(root) = self.root {
             seq_arcs(root, &mut out);
