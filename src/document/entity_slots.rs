@@ -15,6 +15,7 @@ pub(crate) struct EntitySlots(CowSeq<EntityType>);
 impl EntitySlots {
     pub(crate) fn new() -> Self { Self(CowSeq::new()) }
     pub(crate) fn len(&self) -> usize { self.0.len() }
+    pub(crate) fn into_arcs(self) -> Vec<Arc<EntityType>> { self.0.into_arcs() }
     pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
     pub(crate) fn reserve(&mut self, _additional: usize) {}
     pub(crate) fn clear(&mut self) { self.0.clear(); }
