@@ -1275,6 +1275,21 @@ pub struct SummaryInfo {
     pub custom_properties: Vec<(String, String)>,
 }
 
+/// The original positions of modeled entities detached from an I/O baseline.
+/// Each payload may share the editable document's immutable entity image;
+/// the remaining CadDocument retains tables, objects, raw records and all
+/// unmodeled native fields. This is not a stand-alone drawing.
+#[derive(Debug, Clone)]
+pub struct DetachedEntitySlots<T> {
+    total: usize,
+    rows: Vec<(usize, Handle, T)>,
+}
+
+impl<T> DetachedEntitySlots<T> {
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+}
+
 /// A CAD document containing all drawing data
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -3594,6 +3609,101 @@ impl CadDocument {
         self.entities.append(entities);
         self.next_handle = next_handle;
         self.header.handle_seed = self.header.handle_seed.max(next_handle);
+    }
+
+    /// Detach selected, independently reconstructible entities from an I/O
+    /// baseline, without deleting their block membership, raw records or
+    /// referenced objects. The projector must keep every field not represented
+    /// by its shared editable image. A sparse baseline must not be used by
+    /// writers or general CAD operations before rejoining the slots.
+    pub fn detach_entity_slots<T>(
+        &mut self,
+        mut project: impl FnMut(&EntityType) -> Option<T>,
+    ) -> DetachedEntitySlots<T> {
+        let total = self.entities.len();
+        let mut detached = DetachedEntitySlots { total, rows: Vec::new() };
+        // Duplicate/null/misindexed handles cannot be safely split.
+        if self.active_entity_change_recorder().is_some()
+            || self.entity_index.len() != total
+            || self.entities.iter().enumerate().any(|(slot, entity)| {
+                let handle = entity.common().handle;
+                handle.is_null() || self.entity_index.get(&handle) != Some(&slot)
+            })
+        {
+            return detached;
+        }
+        let mut kept = Vec::new();
+        for (slot, entity) in self.entities.iter().enumerate() {
+            if let Some(payload) = project(entity.as_ref()) {
+                detached.rows.push((slot, entity.common().handle, payload));
+            } else {
+                kept.push(Arc::clone(entity));
+            }
+        }
+        if !detached.is_empty() {
+            self.replace_io_entity_slots(kept);
+        }
+        detached
+    }
+
+    /// Rejoin detached entity images in their exact original flat order.
+    /// No add/remove APIs are used: raw record identity, block membership,
+    /// handle allocator and unrelated native objects remain untouched.
+    /// On any invalid reconstruction the sparse document is left unchanged.
+    pub fn rejoin_entity_slots<T>(
+        &mut self,
+        detached: &DetachedEntitySlots<T>,
+        mut rebuild: impl FnMut(&T) -> Option<EntityType>,
+    ) -> Result<()> {
+        if detached.is_empty() {
+            return Ok(());
+        }
+        if self.active_entity_change_recorder().is_some()
+            || self.entities.len().checked_add(detached.len()) != Some(detached.total)
+        {
+            return Err(crate::error::DxfError::Custom("Detached entity slot count mismatch".into()));
+        }
+        let mut rows = detached.rows.iter().peekable();
+        let mut kept = self.entities.iter();
+        let mut joined = Vec::with_capacity(detached.total);
+        let mut handles = HashSet::with_capacity(detached.total);
+        for slot in 0..detached.total {
+            let entity = if rows.peek().is_some_and(|row| row.0 == slot) {
+                let (_, handle, payload) = rows.next().expect("peeked detached row");
+                let Some(entity) = rebuild(payload) else {
+                    return Err(crate::error::DxfError::Custom("Cannot reconstruct detached entity".into()));
+                };
+                if entity.common().handle != *handle {
+                    return Err(crate::error::DxfError::Custom("Detached entity handle mismatch".into()));
+                }
+                Arc::new(entity)
+            } else {
+                let Some(entity) = kept.next() else {
+                    return Err(crate::error::DxfError::Custom("Missing retained entity slot".into()));
+                };
+                Arc::clone(entity)
+            };
+            let handle = entity.common().handle;
+            if handle.is_null() || !handles.insert(handle) {
+                return Err(crate::error::DxfError::Custom("Duplicate or null rejoined entity handle".into()));
+            }
+            joined.push(entity);
+        }
+        if rows.next().is_some() || kept.next().is_some() {
+            return Err(crate::error::DxfError::Custom("Unexpected remaining entity slots".into()));
+        }
+        self.replace_io_entity_slots(joined);
+        Ok(())
+    }
+
+    fn replace_io_entity_slots(&mut self, mut entities: Vec<Arc<EntityType>>) {
+        let mut index: Vec<_> = entities.iter().enumerate()
+            .map(|(slot, entity)| (entity.common().handle, slot)).collect();
+        index.sort_unstable_by_key(|&(handle, _)| handle);
+        self.entity_index = CowMap::from_sorted_unique(index);
+        let mut slots = EntitySlots::new();
+        slots.append(&mut entities);
+        self.entities = slots;
     }
 
     /// Get an entity by handle
