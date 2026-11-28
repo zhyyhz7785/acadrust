@@ -3633,13 +3633,7 @@ impl CadDocument {
         let total = self.entities.len();
         let mut detached = DetachedEntitySlots { total, rows: Vec::new() };
         // Duplicate/null/misindexed handles cannot be safely split.
-        if self.active_entity_change_recorder().is_some()
-            || self.entity_index.len() != total
-            || self.entities.iter().enumerate().any(|(slot, entity)| {
-                let handle = entity.common().handle;
-                handle.is_null() || self.entity_index.get(&handle) != Some(&slot)
-            })
-        {
+        if !self.can_detach_io_slots() {
             return detached;
         }
         let mut kept = Vec::new();
@@ -3654,6 +3648,52 @@ impl CadDocument {
             self.replace_io_entity_slots(kept);
         }
         detached
+    }
+
+    /// Consume native slot Arcs during import. The projector either owns
+    /// the detached residue or returns the original, unchanged source Arc.
+    /// No normal edit API is involved, so raw DWG records, block membership
+    /// and allocator state are preserved. Invalid slot indexes invoke no
+    /// projector and leave the document untouched.
+    pub fn detach_entity_slots_owned<T>(
+        &mut self,
+        mut project: impl FnMut(Arc<EntityType>) -> std::result::Result<T, Arc<EntityType>>,
+    ) -> DetachedEntitySlots<T> {
+        let total = self.entities.len();
+        let mut detached = DetachedEntitySlots { total, rows: Vec::new() };
+        if !self.can_detach_io_slots() || total == 0 {
+            return detached;
+        }
+        let source = std::mem::take(&mut self.entities).into_arcs();
+        let mut kept = Vec::new();
+        for (slot, entity) in source.into_iter().enumerate() {
+            let handle = entity.common().handle;
+            match project(entity) {
+                Ok(payload) => detached.rows.push((slot, handle, payload)),
+                Err(entity) => {
+                    // This is the projector's contract, not a file-data
+                    // assumption: the original retained slot must survive.
+                    assert_eq!(entity.common().handle, handle, "retained source handle changed");
+                    kept.push(entity);
+                }
+            }
+        }
+        if detached.is_empty() {
+            // The original handle index remains valid.
+            self.entities.append(&mut kept);
+        } else {
+            self.replace_io_entity_slots(kept);
+        }
+        detached
+    }
+
+    fn can_detach_io_slots(&self) -> bool {
+        self.active_entity_change_recorder().is_none()
+            && self.entity_index.len() == self.entities.len()
+            && self.entities.iter().enumerate().all(|(slot, entity)| {
+                let handle = entity.common().handle;
+                !handle.is_null() && self.entity_index.get(&handle) == Some(&slot)
+            })
     }
 
     /// Rejoin detached entity images in their exact original flat order.
